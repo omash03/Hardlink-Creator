@@ -20,3 +20,5 @@
 
 **Edge Cases**
 * Prevent duplicate episodes or seasons from being created.
+
+* Seasons split into multiple parts should be normalized into one unified season folder hardlink
