@@ -1,8 +1,13 @@
 # Paths are relative to the application executable unless they are absolute.
 source_directory: "E:/media/folder/Grouped Folder"
-output_directory: "E:/hardlinks/anime/Grouped Hardlink Folder"
+output_directory: "E:/hardlinks/media/Grouped Hardlink Folder"
 
 # Set to true to process every immediate subfolder of the configured root paths.
 process_all_folders: false
 source_root_directory: "E:/media/folder/"
 output_root_directory: "E:/hardlinks/folder/"
+
+# Optional regular expressions matched against source file and folder names.
+# A matching folder and its entire contents are skipped.
+blacklist: 
+  - '^(?i)featurettes'

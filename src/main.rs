@@ -22,6 +22,34 @@ struct Config {
     source_root_directory: Option<PathBuf>,
     #[serde(default)]
     output_root_directory: Option<PathBuf>,
+    #[serde(default)]
+    blacklist: Vec<String>,
+}
+
+#[derive(Default)]
+struct Blacklist {
+    patterns: Vec<Regex>,
+}
+
+impl Blacklist {
+    fn from_patterns(patterns: &[String]) -> Result<Self> {
+        let patterns = patterns
+            .iter()
+            .map(|pattern| {
+                Regex::new(pattern).with_context(|| format!("Invalid blacklist regex: {pattern}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { patterns })
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        path.components().any(|component| {
+            let component = component.as_os_str().to_string_lossy();
+            self.patterns
+                .iter()
+                .any(|pattern| pattern.is_match(&component))
+        })
+    }
 }
 
 fn main() {
@@ -62,6 +90,7 @@ fn run() -> Result<()> {
     };
     let source_directory = resolve_path(&application_directory, configured_source);
     let output_directory = resolve_path(&application_directory, configured_output);
+    let blacklist = Blacklist::from_patterns(&config.blacklist)?;
 
     if !source_directory.is_dir() {
         bail!(
@@ -98,9 +127,19 @@ fn run() -> Result<()> {
         output_directory.display()
     )?;
     let summary = if config.process_all_folders {
-        create_hard_links_for_all_folders(&source_directory, &output_directory, &mut log)?
+        create_hard_links_for_all_folders_with_blacklist(
+            &source_directory,
+            &output_directory,
+            &mut log,
+            &blacklist,
+        )?
     } else {
-        create_hard_links(&source_directory, &output_directory, &mut log)?
+        create_hard_links_with_blacklist(
+            &source_directory,
+            &output_directory,
+            &mut log,
+            &blacklist,
+        )?
     };
     writeln!(
         log,
@@ -155,16 +194,32 @@ impl Summary {
     }
 }
 
+#[cfg(test)]
 fn create_hard_links_for_all_folders(
     source_root_directory: &Path,
     output_root_directory: &Path,
     log: &mut File,
+) -> Result<Summary> {
+    create_hard_links_for_all_folders_with_blacklist(
+        source_root_directory,
+        output_root_directory,
+        log,
+        &Blacklist::default(),
+    )
+}
+
+fn create_hard_links_for_all_folders_with_blacklist(
+    source_root_directory: &Path,
+    output_root_directory: &Path,
+    log: &mut File,
+    blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     summary.add(create_direct_hard_links(
         source_root_directory,
         output_root_directory,
         log,
+        blacklist,
     )?);
     let mut folder_entries = read_directory_entries(source_root_directory)?;
     folder_entries.sort_by_key(|entry| entry.file_name());
@@ -175,6 +230,15 @@ fn create_hard_links_for_all_folders(
         }
 
         let source_folder = folder_entry.path();
+        if blacklist.matches(&source_folder) {
+            writeln!(
+                log,
+                "SKIP folder={} reason=blacklist",
+                source_folder.display()
+            )?;
+            summary.skipped += 1;
+            continue;
+        }
         let folder_name = folder_entry.file_name();
         let output_folder = output_root_directory.join(&folder_name);
         fs::create_dir_all(&output_folder).with_context(|| {
@@ -190,19 +254,45 @@ fn create_hard_links_for_all_folders(
             output_folder.display()
         )?;
 
-        summary.add(create_hard_links(&source_folder, &output_folder, log)?);
+        summary.add(create_hard_links_with_blacklist(
+            &source_folder,
+            &output_folder,
+            log,
+            blacklist,
+        )?);
     }
 
     Ok(summary)
 }
 
+#[cfg(test)]
 fn create_hard_links(
     source_directory: &Path,
     output_directory: &Path,
     log: &mut File,
 ) -> Result<Summary> {
+    create_hard_links_with_blacklist(
+        source_directory,
+        output_directory,
+        log,
+        &Blacklist::default(),
+    )
+}
+
+fn create_hard_links_with_blacklist(
+    source_directory: &Path,
+    output_directory: &Path,
+    log: &mut File,
+    blacklist: &Blacklist,
+) -> Result<Summary> {
     let mut seasons_seen = HashSet::new();
-    create_hard_links_recursive(source_directory, output_directory, &mut seasons_seen, log)
+    create_hard_links_recursive(
+        source_directory,
+        output_directory,
+        &mut seasons_seen,
+        log,
+        blacklist,
+    )
 }
 
 fn create_hard_links_recursive(
@@ -210,6 +300,7 @@ fn create_hard_links_recursive(
     output_directory: &Path,
     seasons_seen: &mut HashSet<u32>,
     log: &mut File,
+    blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     let mut season_entries = read_directory_entries(source_directory)?;
@@ -218,6 +309,7 @@ fn create_hard_links_recursive(
         source_directory,
         output_directory,
         log,
+        blacklist,
     )?);
 
     let mut processed_season_paths = HashSet::new();
@@ -229,16 +321,38 @@ fn create_hard_links_recursive(
         if processed_season_paths.contains(&season_path) {
             continue;
         }
+        if blacklist.matches(&season_path) {
+            writeln!(
+                log,
+                "SKIP folder={} reason=blacklist",
+                season_path.display()
+            )?;
+            summary.skipped += 1;
+            continue;
+        }
 
         let season_name = season_entry.file_name().to_string_lossy().into_owned();
         let Some((season_number, grouped_indices)) =
             find_season_folder_group(&season_entries, season_index)?
         else {
+            let contains_nested_seasons = contains_season_folder(&season_path)?;
+            let nested_output_directory = if contains_nested_seasons {
+                writeln!(
+                    log,
+                    "FLATTEN source={} output={} reason=nested-season-folders",
+                    season_path.display(),
+                    output_directory.display()
+                )?;
+                output_directory.to_path_buf()
+            } else {
+                output_directory.join(&season_name)
+            };
             summary.add(create_hard_links_recursive(
                 &season_path,
-                &output_directory.join(&season_name),
+                &nested_output_directory,
                 seasons_seen,
                 log,
+                blacklist,
             )?);
             continue;
         };
@@ -272,10 +386,27 @@ fn create_hard_links_recursive(
             &destination_season,
             season_number,
             log,
+            blacklist,
         )?);
     }
 
     Ok(summary)
+}
+
+fn contains_season_folder(directory: &Path) -> Result<bool> {
+    let entries = read_directory_entries(directory)?;
+    for (index, entry) in entries.iter().enumerate() {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if find_season_folder_group(&entries, index)?.is_some()
+            || contains_season_folder(&entry.path())?
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn create_hard_links_for_season_folders(
@@ -283,6 +414,7 @@ fn create_hard_links_for_season_folders(
     destination_season: &Path,
     season_number: u32,
     log: &mut File,
+    blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     let mut episodes_seen = HashSet::new();
@@ -297,6 +429,11 @@ fn create_hard_links_for_season_folders(
             }
 
             let source_path = episode_entry.path();
+            if blacklist.matches(&source_path) {
+                writeln!(log, "SKIP file={} reason=blacklist", source_path.display())?;
+                summary.skipped += 1;
+                continue;
+            }
             if !is_video_file(&source_path) {
                 writeln!(
                     log,
@@ -478,6 +615,7 @@ fn create_direct_hard_links(
     source_directory: &Path,
     destination_directory: &Path,
     log: &mut File,
+    blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     fs::create_dir_all(&destination_directory).with_context(|| {
@@ -495,6 +633,11 @@ fn create_direct_hard_links(
         }
 
         let source_path = file_entry.path();
+        if blacklist.matches(&source_path) {
+            writeln!(log, "SKIP file={} reason=blacklist", source_path.display())?;
+            summary.skipped += 1;
+            continue;
+        }
         if !is_video_file(&source_path) {
             writeln!(
                 log,
@@ -643,9 +786,9 @@ fn read_directory_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
 
 fn extract_season_folder_number(name: &str) -> Option<u32> {
     let patterns = [
-        r"(?i)^season[ ._-]*(\d{1,3})(?:$|[ ._-]+)",
-        r"(?i)^s(\d{1,3})(?:$|[ ._-]+)",
         r"^(\d{1,3})(?:$|[ ._-]+)",
+        r"(?i)(?:^|[^a-z0-9])season[ ._-]*(\d{1,3})(?:$|[ ._-]+)",
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,3})(?:$|[ ._-]+)",
     ];
 
     patterns.iter().find_map(|pattern| {
@@ -859,6 +1002,14 @@ mod tests {
     fn extracts_common_season_folder_names() {
         assert_eq!(extract_season_folder_number("Season 01"), Some(1));
         assert_eq!(extract_season_folder_number("S02"), Some(2));
+        assert_eq!(
+            extract_season_folder_number("[Author] Show Name - S03 v2 [1080p AV1][Dual Audio]"),
+            Some(3)
+        );
+        assert_eq!(
+            extract_season_folder_number("Show.name.S04P01.1080p.WEBRip.Dual.Audio.AV1-Author"),
+            None
+        );
         assert_eq!(extract_season_folder_number("03 - Show name"), Some(3));
         assert_eq!(extract_season_folder_number("13 - Show name S1"), Some(13));
         assert_eq!(extract_season_folder_number("Specials"), None);
@@ -880,6 +1031,10 @@ mod tests {
             Some((2, 2))
         );
         assert_eq!(
+            extract_season_and_part_number("Show.name.S04P01.1080p.WEBRip.Dual.Audio.AV1-Author"),
+            Some((4, 1))
+        );
+        assert_eq!(
             extract_season_and_part_number("Show Name Part 2 of Season 2"),
             Some((2, 2))
         );
@@ -888,7 +1043,7 @@ mod tests {
     #[test]
     fn accepts_a_batch_only_configuration() {
         let config: super::Config = serde_yaml::from_str(
-            "process_all_folders: true\nsource_root_directory: /source\noutput_root_directory: /output\n",
+            "process_all_folders: true\nsource_root_directory: /source\noutput_root_directory: /output\nblacklist: ['^sample']\n",
         )
         .unwrap();
 
@@ -903,6 +1058,7 @@ mod tests {
             config.output_root_directory.as_deref(),
             Some(std::path::Path::new("/output"))
         );
+        assert_eq!(config.blacklist, vec!["^sample"]);
     }
 
     #[test]
@@ -910,6 +1066,53 @@ mod tests {
         assert!(super::is_video_file(std::path::Path::new("episode.mkv")));
         assert!(super::is_video_file(std::path::Path::new("episode.MP4")));
         assert!(!super::is_video_file(std::path::Path::new("episode.nfo")));
+    }
+
+    #[test]
+    fn skips_blacklisted_files_and_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-blacklist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let first_season = source.join("Season 01");
+        let blacklisted_season = source.join("Season 02");
+        let output = root.join("output");
+        std::fs::create_dir_all(&first_season).unwrap();
+        std::fs::create_dir_all(&blacklisted_season).unwrap();
+        std::fs::write(first_season.join("Show - S01E01.mkv"), b"episode").unwrap();
+        std::fs::write(first_season.join("sample.mkv"), b"sample").unwrap();
+        std::fs::write(
+            blacklisted_season.join("Show - S02E01.mkv"),
+            b"blacklisted season",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let blacklist = super::Blacklist::from_patterns(&[
+            String::from(r"^sample\.mkv$"),
+            String::from(r"^Season 02$"),
+        ])
+        .unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary =
+            super::create_hard_links_with_blacklist(&source, &output, &mut log, &blacklist)
+                .unwrap();
+
+        assert_eq!(summary.linked, 1);
+        assert_eq!(summary.skipped, 2);
+        assert!(output.join("Season 01").join("[S01E01] Show.mkv").exists());
+        assert!(!output.join("Season 01").join("sample.mkv").exists());
+        assert!(!output.join("Season 02").exists());
+        let log_contents = std::fs::read_to_string(root.join("changes.log")).unwrap();
+        assert!(log_contents.contains("SKIP file="));
+        assert!(log_contents.contains("sample.mkv"));
+        assert!(log_contents.contains("SKIP folder="));
+        assert!(log_contents.contains("Season 02"));
+        assert!(log_contents.contains("reason=blacklist"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1249,18 +1452,23 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         assert!(
             output
-                .join("Release S01+02+Movie")
                 .join("Season 01")
                 .join("[S01E01] Show - Title.mkv")
                 .exists()
         );
         assert!(
             output
-                .join("Release S01+02+Movie")
                 .join("Season 02")
                 .join("[S02E01] Show - Return.mkv")
                 .exists()
         );
+        assert!(!output.join("Release S01+02+Movie").exists());
+        let log_contents = std::fs::read_to_string(root.join("changes.log")).unwrap();
+        assert!(log_contents.contains(&format!(
+            "FLATTEN source={} output={} reason=nested-season-folders",
+            release_folder.display(),
+            output.display()
+        )));
 
         std::fs::remove_dir_all(root).unwrap();
     }
