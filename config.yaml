@@ -1,16 +1,20 @@
 # Paths are relative to the application executable unless they are absolute.
+# Absolute paths are useful when the media library lives on another drive.
 source_directory: "E:/media/folder/Grouped Folder"
 output_directory: "E:/hardlinks/media/Grouped Hardlink Folder"
 
-# Set to true to process every immediate subfolder of the configured root paths.
+# Set to false to process one source_directory, or true to process every
+# immediate subfolder of source_root_directory into the matching output root.
 process_all_folders: false
 source_root_directory: "E:/media/folder/"
 output_root_directory: "E:/hardlinks/folder/"
 
-# Run once immediately, then scan again after this many seconds.
+# Run once immediately, then scan again after this many seconds. The process
+# stays open until it is stopped with Ctrl+C.
 scan_interval_seconds: 600
 
-# Optional regular expressions matched against source file and folder names.
-# A matching folder and its entire contents are skipped.
+# Optional regular expressions matched against each source file/folder name.
+# A matching folder and its entire contents are skipped. Use inline regex flags
+# such as (?i) when a pattern should be case-insensitive.
 blacklist: 
   - '^(?i)featurettes'

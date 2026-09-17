@@ -1,3 +1,17 @@
+//! Create normalized hard links for video files in a media library.
+//!
+//! The application treats the source tree as read-only media and builds a
+//! second tree of hard links for a media server such as Jellyfin. A hard link
+//! gives the destination file a different name and location while both names
+//! still refer to the same file data on disk. This keeps the operation cheap
+//! and avoids duplicating large video files.
+//!
+//! The program is intentionally a polling application rather than a file
+//! system watcher. Each scan walks the configured source tree, skips anything
+//! that is not a recognized video file, and leaves already-created links
+//! alone. Polling makes the behavior predictable across local and network
+//! drives, and the interval is configured in `config.yaml`.
+
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use regex::Regex;
@@ -11,8 +25,16 @@ use std::thread;
 use std::time::Duration;
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
+/// Five minutes is long enough to avoid repeatedly scanning a large library,
+/// while still making newly downloaded media appear without manual reruns.
 const DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 300;
 
+/// Write one structured event to the persistent log and mirror it to stdout.
+///
+/// The file remains the authoritative historical record, while stdout gives
+/// a user who leaves the console window open immediate feedback. The helper
+/// deliberately writes to the file first: if the file cannot be written, the
+/// scan fails instead of displaying a success message that was not persisted.
 macro_rules! log_line {
     ($log:expr, $($arg:tt)*) => {{
         writeln!($log, $($arg)*)?;
@@ -21,34 +43,59 @@ macro_rules! log_line {
     }};
 }
 
+/// Values loaded from `config.yaml`.
+///
+/// Single-folder mode uses `source_directory` and `output_directory`. Batch
+/// mode uses the corresponding `*_root_directory` values and processes each
+/// immediate child folder under those roots. Optional fields are represented
+/// as `Option<PathBuf>` so a missing path can produce a useful mode-specific
+/// error instead of silently falling back to a different directory.
 #[derive(Debug, Deserialize)]
 struct Config {
+    /// One media folder to scan when `process_all_folders` is disabled.
     #[serde(default)]
     source_directory: Option<PathBuf>,
+    /// Destination folder for links made from `source_directory`.
     #[serde(default)]
     output_directory: Option<PathBuf>,
+    /// Select batch mode when true; otherwise scan one configured folder.
     #[serde(default)]
     process_all_folders: bool,
+    /// Root containing multiple media folders in batch mode.
     #[serde(default)]
     source_root_directory: Option<PathBuf>,
+    /// Root under which matching batch-mode output folders are created.
     #[serde(default)]
     output_root_directory: Option<PathBuf>,
+    /// Case-sensitive regular expressions matched against individual path components.
     #[serde(default)]
     blacklist: Vec<String>,
+    /// Delay between completed scans, measured in seconds.
     #[serde(default = "default_scan_interval_seconds")]
     scan_interval_seconds: u64,
 }
 
+/// Supplies the default scan interval used when older config files omit it.
 fn default_scan_interval_seconds() -> u64 {
     DEFAULT_SCAN_INTERVAL_SECONDS
 }
 
+/// Compiled blacklist expressions used during a scan.
+///
+/// Expressions are compiled once at startup rather than once per file. This
+/// both makes invalid configuration fail early and keeps directory traversal
+/// focused on filesystem work.
 #[derive(Default)]
 struct Blacklist {
+    /// Regexes tested against each component of a source path.
     patterns: Vec<Regex>,
 }
 
 impl Blacklist {
+    /// Compile user-provided expressions into a scan-ready blacklist.
+    ///
+    /// Returning an error here prevents a malformed pattern from producing a
+    /// partially processed library.
     fn from_patterns(patterns: &[String]) -> Result<Self> {
         let patterns = patterns
             .iter()
@@ -59,6 +106,11 @@ impl Blacklist {
         Ok(Self { patterns })
     }
 
+    /// Return true when any path component matches any configured expression.
+    ///
+    /// Matching components instead of the entire path lets a user blacklist a
+    /// folder name and automatically exclude everything below that folder,
+    /// regardless of where it appears in the source tree.
     fn matches(&self, path: &Path) -> bool {
         path.components().any(|component| {
             let component = component.as_os_str().to_string_lossy();
@@ -69,6 +121,8 @@ impl Blacklist {
     }
 }
 
+/// Start the application and convert any fatal error into a readable console
+/// message followed by a non-zero process exit.
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error:#}");
@@ -76,6 +130,18 @@ fn main() {
     }
 }
 
+/// Load configuration, validate the selected mode, and run scans forever.
+///
+/// A scan runs immediately on startup. After it completes, the process sleeps
+/// for the configured interval and begins another scan. The loop is kept at
+/// this level so the media traversal functions remain single-scan operations:
+/// they do not need to know whether they were called once or by a background
+/// worker.
+///
+/// The configuration and compiled blacklist are intentionally loaded once.
+/// This means editing `config.yaml` while the process is running takes effect
+/// after restarting the application, which avoids changing source or output
+/// roots halfway through a scan.
 fn run() -> Result<()> {
     let application_directory = env::current_exe()?
         .parent()
@@ -182,6 +248,11 @@ fn run() -> Result<()> {
     }
 }
 
+/// Read and deserialize the YAML configuration file.
+///
+/// Configuration is located beside the executable rather than relative to the
+/// process working directory. This makes launching the program from a task
+/// scheduler, shortcut, or another terminal behave consistently.
 fn read_config(config_path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(config_path).with_context(|| {
         format!(
@@ -197,6 +268,10 @@ fn read_config(config_path: &Path) -> Result<Config> {
     })
 }
 
+/// Convert the configured number of seconds into a validated sleep duration.
+///
+/// A zero interval is rejected because it would create a busy loop that scans
+/// continuously, consumes CPU, and can make the console and log unusable.
 fn scan_interval(config: &Config) -> Result<Duration> {
     if config.scan_interval_seconds == 0 {
         bail!("scan_interval_seconds must be greater than zero");
@@ -204,6 +279,10 @@ fn scan_interval(config: &Config) -> Result<Duration> {
     Ok(Duration::from_secs(config.scan_interval_seconds))
 }
 
+/// Resolve a config path relative to the executable unless it is absolute.
+///
+/// Relative paths are useful when moving the application and its config as a
+/// unit; absolute paths remain available for media libraries on another drive.
 fn resolve_path(application_directory: &Path, configured_path: &Path) -> PathBuf {
     if configured_path.is_absolute() {
         configured_path.to_path_buf()
@@ -212,14 +291,28 @@ fn resolve_path(application_directory: &Path, configured_path: &Path) -> PathBuf
     }
 }
 
+/// Counts the outcomes of one complete traversal.
+///
+/// `linked` counts successful hard-link creations. `skipped` includes files
+/// rejected by the blacklist, non-video files, duplicate episodes, and
+/// destinations that already exist. `warnings` is reserved for actionable
+/// anomalies such as a video filename without an episode number.
 #[derive(Default)]
 struct Summary {
+    /// Number of new hard links created during the scan.
     linked: usize,
+    /// Number of files or folders intentionally left untouched.
     skipped: usize,
+    /// Number of files that could not be interpreted but did not abort a scan.
     warnings: usize,
 }
 
 impl Summary {
+    /// Add another traversal's counters to this aggregate.
+    ///
+    /// Recursive directory processing returns local summaries. Keeping the
+    /// accumulation operation here makes it difficult for a caller to forget
+    /// one counter when combining nested results.
     fn add(&mut self, other: Summary) {
         self.linked += other.linked;
         self.skipped += other.skipped;
@@ -228,6 +321,7 @@ impl Summary {
 }
 
 #[cfg(test)]
+/// Test convenience wrapper for the batch traversal without blacklist rules.
 fn create_hard_links_for_all_folders(
     source_root_directory: &Path,
     output_root_directory: &Path,
@@ -241,6 +335,12 @@ fn create_hard_links_for_all_folders(
     )
 }
 
+/// Process direct files and each immediate child folder under a batch root.
+///
+/// The root itself is scanned first so standalone movies are not lost. Each
+/// child folder gets a matching destination folder and is then processed using
+/// the same recursive season logic as single-folder mode. Entries are sorted
+/// before traversal to make duplicate resolution deterministic across scans.
 fn create_hard_links_for_all_folders_with_blacklist(
     source_root_directory: &Path,
     output_root_directory: &Path,
@@ -248,6 +348,8 @@ fn create_hard_links_for_all_folders_with_blacklist(
     blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
+    // Scan files in the current directory before descending so a movie placed
+    // beside season folders is handled by the same pass.
     summary.add(create_direct_hard_links(
         source_root_directory,
         output_root_directory,
@@ -299,6 +401,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
 }
 
 #[cfg(test)]
+/// Test convenience wrapper for a single-folder traversal without blacklist rules.
 fn create_hard_links(
     source_directory: &Path,
     output_directory: &Path,
@@ -312,6 +415,11 @@ fn create_hard_links(
     )
 }
 
+/// Process one media tree while applying the configured blacklist.
+///
+/// A fresh `seasons_seen` set is created for every top-level scan. It prevents
+/// the same season number from being emitted twice within that scan, while the
+/// destination filesystem checks make later polling passes idempotent.
 fn create_hard_links_with_blacklist(
     source_directory: &Path,
     output_directory: &Path,
@@ -328,6 +436,13 @@ fn create_hard_links_with_blacklist(
     )
 }
 
+/// Recursively inspect a directory and build normalized season output.
+///
+/// Direct files are handled before child directories because a folder may
+/// contain standalone movies alongside seasons. A child that contains nested
+/// season folders is flattened into the current output directory; an ordinary
+/// unnumbered child keeps its own name. Numbered and split-part season folders
+/// are grouped before episode links are created.
 fn create_hard_links_recursive(
     source_directory: &Path,
     output_directory: &Path,
@@ -369,6 +484,9 @@ fn create_hard_links_recursive(
             find_season_folder_group(&season_entries, season_index)?
         else {
             let contains_nested_seasons = contains_season_folder(&season_path)?;
+            // Wrapper/release folders are presentation details. Flatten only
+            // when a nested season proves that preserving the wrapper would
+            // add an unwanted level to the media-server layout.
             let nested_output_directory = if contains_nested_seasons {
                 log_line!(
                     log,
@@ -407,6 +525,8 @@ fn create_hard_links_recursive(
 
         let destination_name = season_destination_name(&season_entries, &grouped_indices);
         let destination_season = output_directory.join(destination_name);
+        // Create the destination once for the whole logical season, including
+        // all split-part source folders that were grouped above.
         fs::create_dir_all(&destination_season).with_context(|| {
             format!(
                 "Could not create season directory {}",
@@ -426,6 +546,11 @@ fn create_hard_links_recursive(
     Ok(summary)
 }
 
+/// Determine whether a directory contains a recognizable season at any depth.
+///
+/// This look-ahead controls flattening for release/layout wrapper folders. It
+/// is separate from the actual linking traversal so the output decision is
+/// made before links from that subtree are created.
 fn contains_season_folder(directory: &Path) -> Result<bool> {
     let entries = read_directory_entries(directory)?;
     for (index, entry) in entries.iter().enumerate() {
@@ -442,6 +567,13 @@ fn contains_season_folder(directory: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Create links for all episode files belonging to one logical season.
+///
+/// `season_paths` may contain multiple physical folders when a release splits
+/// one season into parts. A single `episodes_seen` set spans those folders so
+/// duplicate episode numbers are skipped consistently. Files are sorted by
+/// name before processing, which gives the first deterministic candidate the
+/// episode number when duplicates exist.
 fn create_hard_links_for_season_folders(
     season_paths: &[PathBuf],
     destination_season: &Path,
@@ -450,6 +582,8 @@ fn create_hard_links_for_season_folders(
     blacklist: &Blacklist,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
+    // This set spans every source folder in a split season. That is what makes
+    // episode de-duplication work across parts, not just within one folder.
     let mut episodes_seen = HashSet::new();
 
     for season_path in season_paths {
@@ -560,6 +694,13 @@ fn create_hard_links_for_season_folders(
     Ok(summary)
 }
 
+/// Find the season number and all sibling folders that belong to one season.
+///
+/// Folder names in downloaded releases are not uniform. This function accepts
+/// explicit forms such as `Season 2`, `S02`, and `S02 P2`, then uses normalized
+/// title keys to associate a markerless folder with a named split part. The
+/// returned indices refer to the already-sorted `entries` slice, allowing the
+/// caller to mark every grouped folder as processed exactly once.
 fn find_season_folder_group(
     entries: &[fs::DirEntry],
     seed_index: usize,
@@ -572,6 +713,9 @@ fn find_season_folder_group(
     let mut season_number = seed_info.season_number;
     let mut anchor_key = seed_info.title_key.clone();
 
+    // A markerless folder can inherit its season number from a sibling such as
+    // "Show Name S02 P1". The sibling's normalized title becomes the grouping
+    // anchor for the second pass below.
     if season_number.is_none() {
         for (index, entry) in entries.iter().enumerate() {
             if index == seed_index || !entry.file_type()?.is_dir() {
@@ -596,6 +740,9 @@ fn find_season_folder_group(
     };
 
     let mut grouped_indices = Vec::new();
+    // Include explicit same-season folders, related split parts, and the seed
+    // itself. The caller records every returned path as processed so grouped
+    // folders are not traversed a second time.
     for (index, entry) in entries.iter().enumerate() {
         if !entry.file_type()?.is_dir() {
             continue;
@@ -624,6 +771,12 @@ fn find_season_folder_group(
     Ok(Some((season_number, grouped_indices)))
 }
 
+/// Select the human-readable output folder name for a grouped season.
+///
+/// Part 1 is preferred because it normally carries the canonical release
+/// name. If no part 1 exists, an unmarked season folder is preferred, and the
+/// first grouped entry is the final fallback. The physical source folders are
+/// never renamed; this only chooses the destination directory name.
 fn season_destination_name(
     entries: &[fs::DirEntry],
     grouped_indices: &[usize],
@@ -644,6 +797,14 @@ fn season_destination_name(
         .unwrap_or_else(|| entries[grouped_indices[0]].file_name())
 }
 
+/// Link video files that live directly in a directory rather than below a
+/// recognizable season folder.
+///
+/// A direct file that already contains `SxxEyy` is renamed to the normalized
+/// format. Other video files retain their original filename because there is
+/// no reliable season context available at this level. Before creating a new
+/// link, the function checks both the intended destination name and all other
+/// files in the destination for an existing hard link to the same source.
 fn create_direct_hard_links(
     source_directory: &Path,
     destination_directory: &Path,
@@ -692,6 +853,9 @@ fn create_direct_hard_links(
         };
         let original_destination_path = destination_directory.join(file_entry.file_name());
         let destination_path = destination_directory.join(destination_name);
+        // There are two idempotence cases: the normalized name may already
+        // exist, or another name may already point to the same source inode.
+        // Handle both before calling hard_link to avoid duplicate output files.
         if destination_path.exists() {
             remove_stale_original_link(
                 &source_path,
@@ -763,6 +927,12 @@ fn create_direct_hard_links(
     Ok(summary)
 }
 
+/// Search a destination directory for a file referring to the same inode as a
+/// source file.
+///
+/// Hard links can have different names, so checking only the expected path is
+/// insufficient. The optional excluded path prevents the original source-name
+/// candidate from being reported when it is being considered for replacement.
 fn find_existing_hard_link(
     source_path: &Path,
     destination_directory: &Path,
@@ -782,6 +952,11 @@ fn find_existing_hard_link(
     Ok(None)
 }
 
+/// Remove an old source-name hard link after a normalized link is available.
+///
+/// The identity check is important: a destination file with the same name but
+/// different contents must never be deleted. This cleanup keeps repeated scans
+/// from leaving both the old and normalized names behind.
 fn remove_stale_original_link(
     source_path: &Path,
     original_destination_path: &Path,
@@ -810,6 +985,12 @@ fn remove_stale_original_link(
     Ok(())
 }
 
+/// Read every directory entry and convert enumeration errors into context-rich
+/// application errors.
+///
+/// Keeping enumeration in one helper ensures all traversal layers report the
+/// directory that failed, which is especially useful for inaccessible network
+/// folders.
 fn read_directory_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
     fs::read_dir(directory)
         .with_context(|| format!("Could not read directory {}", directory.display()))?
@@ -817,6 +998,12 @@ fn read_directory_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
         .with_context(|| format!("Could not enumerate directory {}", directory.display()))
 }
 
+/// Extract a season number from common folder-name conventions.
+///
+/// The patterns intentionally require separators around the number so a year
+/// or an unrelated number inside a title is less likely to be mistaken for a
+/// season. More specific season/part parsing is attempted by
+/// `season_folder_info` before this fallback is used.
 fn extract_season_folder_number(name: &str) -> Option<u32> {
     let patterns = [
         r"^(\d{1,3})(?:$|[ ._-]+)",
@@ -833,12 +1020,21 @@ fn extract_season_folder_number(name: &str) -> Option<u32> {
     })
 }
 
+/// Parsed metadata used when comparing and grouping season folders.
 struct SeasonFolderInfo {
+    /// Season number from an explicit season marker or numeric prefix.
     season_number: Option<u32>,
+    /// Optional part number for releases split into multiple folders.
     part_number: Option<u32>,
+    /// Normalized title prefix used to relate differently decorated folders.
     title_key: String,
 }
 
+/// Parse all season-related metadata needed by the grouping algorithm.
+///
+/// Explicit combined season/part markers take precedence over generic season
+/// detection. The title key is calculated independently so a folder such as
+/// `Show Name Part 2` can still be related to a folder named `Show Name`.
 fn season_folder_info(name: &str) -> SeasonFolderInfo {
     let season_and_part = extract_season_and_part_number(name);
     let season_number = season_and_part
@@ -856,6 +1052,11 @@ fn season_folder_info(name: &str) -> SeasonFolderInfo {
     }
 }
 
+/// Extract `(season, part)` from combined markers such as `S02P01` or
+/// `Part 2 of Season 2`.
+///
+/// The two regular expressions capture the numbers in different orders, so the
+/// second pattern swaps them before returning the common `(season, part)` shape.
 fn extract_season_and_part_number(name: &str) -> Option<(u32, u32)> {
     let patterns = [
         r"(?i)(?:season|s)[ ._-]*(\d{1,3})[ ._-]*(?:part|pt|p)[ ._-]*(\d{1,3})(?:$|[^a-z0-9])",
@@ -874,6 +1075,8 @@ fn extract_season_and_part_number(name: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// Extract a standalone part marker when the season is implied by a sibling
+/// folder, for example `Show Name Part 2`.
 fn extract_standalone_part_number(name: &str) -> Option<u32> {
     let pattern = r"(?i)(?:^|[ ._+-])(?:part|pt)[ ._-]*(\d{1,3})(?:$|[^a-z0-9])";
     Regex::new(pattern)
@@ -883,6 +1086,11 @@ fn extract_standalone_part_number(name: &str) -> Option<u32> {
         .and_then(|number| number.as_str().parse().ok())
 }
 
+/// Build a comparison key from the descriptive portion of a season folder.
+///
+/// Release metadata in square brackets is discarded, season/part markers are
+/// removed, and punctuation is converted to whitespace. The result is used
+/// only for comparison; original folder names remain intact for output naming.
 fn season_folder_title_key(name: &str) -> String {
     let mut title = name;
     let marker_patterns = [
@@ -916,6 +1124,11 @@ fn season_folder_title_key(name: &str) -> String {
         .join(" ")
 }
 
+/// Decide whether two normalized folder titles describe the same release.
+///
+/// Exact matches are accepted, as are one-way prefix matches on a word
+/// boundary. This allows a descriptive suffix on one split-part folder while
+/// avoiding accidental matches such as `Show` and `Showcase`.
 fn season_folder_titles_related(first: &str, second: &str) -> bool {
     if first.is_empty() || second.is_empty() {
         return false;
@@ -929,6 +1142,11 @@ fn season_folder_titles_related(first: &str, second: &str) -> bool {
             .is_some_and(|remainder| remainder.starts_with(' '))
 }
 
+/// Return whether a path has one of the video extensions handled by the app.
+///
+/// The check is case-insensitive and deliberately uses an allowlist. Metadata,
+/// subtitle, image, and sidecar files therefore remain untouched even when
+/// they sit beside a video episode.
 fn is_video_file(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
         return false;
@@ -952,6 +1170,12 @@ fn is_video_file(path: &Path) -> bool {
     )
 }
 
+/// Extract an episode number from common release filename formats.
+///
+/// Patterns are ordered from most explicit to most permissive: `S01E02`,
+/// `1x02`, `Episode 02`, and finally a separated number. The order reduces the
+/// chance that a title number is chosen when a structured episode marker is
+/// present.
 fn extract_episode_number(stem: &str) -> Option<u32> {
     let patterns = [
         r"(?i)\bS\d{1,3}E(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)",
@@ -969,6 +1193,11 @@ fn extract_episode_number(stem: &str) -> Option<u32> {
     })
 }
 
+/// Extract both season and episode numbers from an `SxxEyy` filename marker.
+///
+/// This helper is used for direct files, where the season folder cannot supply
+/// the season number. Other filename styles can provide an episode number but
+/// do not provide enough context to safely normalize the season.
 fn extract_season_and_episode(stem: &str) -> Option<(u32, u32)> {
     Regex::new(r"(?i)\bS(\d{1,3})E(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)")
         .ok()?
@@ -981,6 +1210,12 @@ fn extract_season_and_episode(stem: &str) -> Option<(u32, u32)> {
         })
 }
 
+/// Construct the canonical `[SxxEyy] Title.extension` destination filename.
+///
+/// Existing season/episode markers and a matching standalone episode number
+/// are removed from the title, while release metadata such as uploader and
+/// quality tags is retained. Whitespace and repeated separators are cleaned
+/// after removal so the generated name is stable across polling passes.
 fn corrected_file_name(
     stem: &str,
     season: u32,
@@ -1024,6 +1259,7 @@ fn corrected_file_name(
     format!("[S{season:02}E{episode:02}] {title}{extension}")
 }
 
+/// Unit tests for configuration, parsing, traversal, and hard-link behavior.
 #[cfg(test)]
 mod tests {
     use super::{
