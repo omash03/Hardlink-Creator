@@ -189,21 +189,21 @@ fn run() -> Result<()> {
         )
     })?;
 
-    let log_path = application_directory.join(format!(
-        "changes-{}.log",
-        Local::now().format("%m%d%Y_%H%M")
-    ));
-    let mut log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("Could not open log file {}", log_path.display()))?;
-
     println!(
         "Watching for new files; scanning every {} second(s). Press Ctrl+C to stop.",
         scan_interval.as_secs()
     );
     loop {
+        let log_path = application_directory.join(format!(
+            "changes-{}.log",
+            Local::now().format("%m%d%Y_%H%M")
+        ));
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("Could not open log file {}", log_path.display()))?;
+
         log_line!(
             log,
             "START mode={} source={} output={}",
