@@ -7,8 +7,19 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
+const DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 300;
+
+macro_rules! log_line {
+    ($log:expr, $($arg:tt)*) => {{
+        writeln!($log, $($arg)*)?;
+        println!($($arg)*);
+        Ok::<(), io::Error>(())
+    }};
+}
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -24,6 +35,12 @@ struct Config {
     output_root_directory: Option<PathBuf>,
     #[serde(default)]
     blacklist: Vec<String>,
+    #[serde(default = "default_scan_interval_seconds")]
+    scan_interval_seconds: u64,
+}
+
+fn default_scan_interval_seconds() -> u64 {
+    DEFAULT_SCAN_INTERVAL_SECONDS
 }
 
 #[derive(Default)]
@@ -66,6 +83,7 @@ fn run() -> Result<()> {
         .to_path_buf();
     let config_path = application_directory.join(CONFIG_FILE_NAME);
     let config = read_config(&config_path)?;
+    let scan_interval = scan_interval(&config)?;
     let configured_source = if config.process_all_folders {
         config
             .source_root_directory
@@ -115,45 +133,53 @@ fn run() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("Could not open log file {}", log_path.display()))?;
 
-    writeln!(
-        log,
-        "START mode={} source={} output={}",
-        if config.process_all_folders {
-            "all-folders"
-        } else {
-            "single-folder"
-        },
-        source_directory.display(),
-        output_directory.display()
-    )?;
-    let summary = if config.process_all_folders {
-        create_hard_links_for_all_folders_with_blacklist(
-            &source_directory,
-            &output_directory,
-            &mut log,
-            &blacklist,
-        )?
-    } else {
-        create_hard_links_with_blacklist(
-            &source_directory,
-            &output_directory,
-            &mut log,
-            &blacklist,
-        )?
-    };
-    writeln!(
-        log,
-        "COMPLETE linked={} skipped={} warnings={}",
-        summary.linked, summary.skipped, summary.warnings
-    )?;
     println!(
-        "Linked {} file(s); skipped {} file(s). Log: {}",
-        summary.linked,
-        summary.skipped,
-        log_path.display()
+        "Watching for new files; scanning every {} second(s). Press Ctrl+C to stop.",
+        scan_interval.as_secs()
     );
-
-    Ok(())
+    loop {
+        log_line!(
+            log,
+            "START mode={} source={} output={}",
+            if config.process_all_folders {
+                "all-folders"
+            } else {
+                "single-folder"
+            },
+            source_directory.display(),
+            output_directory.display()
+        )?;
+        let summary = if config.process_all_folders {
+            create_hard_links_for_all_folders_with_blacklist(
+                &source_directory,
+                &output_directory,
+                &mut log,
+                &blacklist,
+            )?
+        } else {
+            create_hard_links_with_blacklist(
+                &source_directory,
+                &output_directory,
+                &mut log,
+                &blacklist,
+            )?
+        };
+        log_line!(
+            log,
+            "COMPLETE linked={} skipped={} warnings={}",
+            summary.linked,
+            summary.skipped,
+            summary.warnings
+        )?;
+        log.flush()?;
+        println!(
+            "Linked {} file(s); skipped {} file(s). Log: {}",
+            summary.linked,
+            summary.skipped,
+            log_path.display()
+        );
+        thread::sleep(scan_interval);
+    }
 }
 
 fn read_config(config_path: &Path) -> Result<Config> {
@@ -169,6 +195,13 @@ fn read_config(config_path: &Path) -> Result<Config> {
             config_path.display()
         )
     })
+}
+
+fn scan_interval(config: &Config) -> Result<Duration> {
+    if config.scan_interval_seconds == 0 {
+        bail!("scan_interval_seconds must be greater than zero");
+    }
+    Ok(Duration::from_secs(config.scan_interval_seconds))
 }
 
 fn resolve_path(application_directory: &Path, configured_path: &Path) -> PathBuf {
@@ -231,7 +264,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
 
         let source_folder = folder_entry.path();
         if blacklist.matches(&source_folder) {
-            writeln!(
+            log_line!(
                 log,
                 "SKIP folder={} reason=blacklist",
                 source_folder.display()
@@ -247,7 +280,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
                 output_folder.display()
             )
         })?;
-        writeln!(
+        log_line!(
             log,
             "FOLDER source={} output={}",
             source_folder.display(),
@@ -322,7 +355,7 @@ fn create_hard_links_recursive(
             continue;
         }
         if blacklist.matches(&season_path) {
-            writeln!(
+            log_line!(
                 log,
                 "SKIP folder={} reason=blacklist",
                 season_path.display()
@@ -337,7 +370,7 @@ fn create_hard_links_recursive(
         else {
             let contains_nested_seasons = contains_season_folder(&season_path)?;
             let nested_output_directory = if contains_nested_seasons {
-                writeln!(
+                log_line!(
                     log,
                     "FLATTEN source={} output={} reason=nested-season-folders",
                     season_path.display(),
@@ -362,7 +395,7 @@ fn create_hard_links_recursive(
             .collect::<Vec<_>>();
         processed_season_paths.extend(grouped_paths.iter().cloned());
         if !seasons_seen.insert(season_number) {
-            writeln!(
+            log_line!(
                 log,
                 "SKIP season={} path={} reason=duplicate-season-number",
                 season_number,
@@ -430,12 +463,12 @@ fn create_hard_links_for_season_folders(
 
             let source_path = episode_entry.path();
             if blacklist.matches(&source_path) {
-                writeln!(log, "SKIP file={} reason=blacklist", source_path.display())?;
+                log_line!(log, "SKIP file={} reason=blacklist", source_path.display())?;
                 summary.skipped += 1;
                 continue;
             }
             if !is_video_file(&source_path) {
-                writeln!(
+                log_line!(
                     log,
                     "SKIP file={} reason=not-video-file",
                     source_path.display()
@@ -448,7 +481,7 @@ fn create_hard_links_for_season_folders(
                 .and_then(|stem| stem.to_str())
                 .context("Episode filename is not valid UTF-8")?;
             let Some(episode_number) = extract_episode_number(source_stem) else {
-                writeln!(
+                log_line!(
                     log,
                     "WARN skip-file path={} reason=no-episode-number",
                     source_path.display()
@@ -457,7 +490,7 @@ fn create_hard_links_for_season_folders(
                 continue;
             };
             if !episodes_seen.insert(episode_number) {
-                writeln!(
+                log_line!(
                     log,
                     "SKIP season={} episode={} path={} reason=duplicate-episode-number",
                     season_number,
@@ -476,7 +509,7 @@ fn create_hard_links_for_season_folders(
             );
             let destination_path = destination_season.join(destination_name);
             if destination_path.exists() {
-                writeln!(
+                log_line!(
                     log,
                     "SKIP season={} episode={} source={} destination={} reason=destination-exists",
                     season_number,
@@ -490,7 +523,7 @@ fn create_hard_links_for_season_folders(
 
             match fs::hard_link(&source_path, &destination_path) {
                 Ok(()) => {
-                    writeln!(
+                    log_line!(
                         log,
                         "LINK season={} episode={} source={} destination={}",
                         season_number,
@@ -501,7 +534,7 @@ fn create_hard_links_for_season_folders(
                     summary.linked += 1;
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    writeln!(
+                    log_line!(
                         log,
                         "SKIP season={} episode={} source={} destination={} reason=destination-exists",
                         season_number,
@@ -634,12 +667,12 @@ fn create_direct_hard_links(
 
         let source_path = file_entry.path();
         if blacklist.matches(&source_path) {
-            writeln!(log, "SKIP file={} reason=blacklist", source_path.display())?;
+            log_line!(log, "SKIP file={} reason=blacklist", source_path.display())?;
             summary.skipped += 1;
             continue;
         }
         if !is_video_file(&source_path) {
-            writeln!(
+            log_line!(
                 log,
                 "SKIP file={} reason=not-video-file",
                 source_path.display()
@@ -666,7 +699,7 @@ fn create_direct_hard_links(
                 &destination_path,
                 log,
             )?;
-            writeln!(
+            log_line!(
                 log,
                 "SKIP source={} destination={} reason=destination-exists",
                 source_path.display(),
@@ -680,7 +713,7 @@ fn create_direct_hard_links(
             destination_directory,
             Some(&original_destination_path),
         )? {
-            writeln!(
+            log_line!(
                 log,
                 "SKIP source={} destination={} reason=hard-link-exists",
                 source_path.display(),
@@ -692,7 +725,7 @@ fn create_direct_hard_links(
 
         match fs::hard_link(&source_path, &destination_path) {
             Ok(()) => {
-                writeln!(
+                log_line!(
                     log,
                     "DIRECT-LINK source={} destination={}",
                     source_path.display(),
@@ -707,7 +740,7 @@ fn create_direct_hard_links(
                 summary.linked += 1;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                writeln!(
+                log_line!(
                     log,
                     "SKIP source={} destination={} reason=destination-exists",
                     source_path.display(),
@@ -768,7 +801,7 @@ fn remove_stale_original_link(
             original_destination_path.display()
         )
     })?;
-    writeln!(
+    log_line!(
         log,
         "CLEANUP source={} destination={} reason=normalized-name",
         source_path.display(),
@@ -1059,6 +1092,24 @@ mod tests {
             Some(std::path::Path::new("/output"))
         );
         assert_eq!(config.blacklist, vec!["^sample"]);
+    }
+
+    #[test]
+    fn uses_a_five_minute_default_scan_interval() {
+        let config: super::Config = serde_yaml::from_str("source_directory: /source\n").unwrap();
+
+        assert_eq!(
+            super::scan_interval(&config).unwrap(),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_scan_interval() {
+        let config: super::Config =
+            serde_yaml::from_str("source_directory: /source\nscan_interval_seconds: 0\n").unwrap();
+
+        assert!(super::scan_interval(&config).is_err());
     }
 
     #[test]

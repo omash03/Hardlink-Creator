@@ -7,6 +7,9 @@ process_all_folders: false
 source_root_directory: "E:/media/folder/"
 output_root_directory: "E:/hardlinks/folder/"
 
+# Run once immediately, then scan again after this many seconds.
+scan_interval_seconds: 600
+
 # Optional regular expressions matched against source file and folder names.
 # A matching folder and its entire contents are skipped.
 blacklist: 

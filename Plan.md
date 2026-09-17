@@ -16,6 +16,8 @@
     * Format must be as follows [S01E01] make sure any other season number or episode number is removed from the file name.
 * Optional batch mode to process every show folder inside a source root into a matching output root.
     * Enable with `process_all_folders: true` and configure `source_root_directory` and `output_root_directory`.
+* Keep running in the background and scan periodically.
+    * Configure the delay between scans with `scan_interval_seconds`.
 
 
 **Edge Cases**
