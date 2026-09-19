@@ -25,6 +25,7 @@ use std::thread;
 use std::time::Duration;
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
+const LOG_DIRECTORY_NAME: &str = "logs";
 /// Five minutes is long enough to avoid repeatedly scanning a large library,
 /// while still making newly downloaded media appear without manual reruns.
 const DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 300;
@@ -188,13 +189,20 @@ fn run() -> Result<()> {
             output_directory.display()
         )
     })?;
+    let log_directory = application_directory.join(LOG_DIRECTORY_NAME);
+    fs::create_dir_all(&log_directory).with_context(|| {
+        format!(
+            "Could not create log directory {}",
+            log_directory.display()
+        )
+    })?;
 
     println!(
         "Watching for new files; scanning every {} second(s). Press Ctrl+C to stop.",
         scan_interval.as_secs()
     );
     loop {
-        let log_path = application_directory.join(format!(
+        let log_path = log_directory.join(format!(
             "changes-{}.log",
             Local::now().format("%m%d%Y_%H%M")
         ));
