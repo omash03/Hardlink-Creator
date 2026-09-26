@@ -775,7 +775,11 @@ fn find_season_folder_group(
         let candidate_name = entry.file_name().to_string_lossy().into_owned();
         let candidate_info = season_folder_info(&candidate_name);
         let same_season = candidate_info.season_number == Some(season_number);
+        // A markerless folder belongs to an explicitly named season only when
+        // that season is a split part. Otherwise, a shared title prefix can
+        // incorrectly absorb a release wrapper that contains its own seasons.
         let related_markerless_folder = candidate_info.season_number.is_none()
+            && (seed_info.part_number.is_some() || seed_info.season_number.is_none())
             && !anchor_key.is_empty()
             && season_folder_titles_related(&anchor_key, &candidate_info.title_key);
         let related_part_folder = candidate_info.part_number.is_some()
@@ -1880,6 +1884,82 @@ mod tests {
             release_folder.display(),
             output.display()
         )));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn does_not_skip_nested_seasons_that_share_a_title_with_later_seasons() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-shared-title-nested-seasons-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let output = root.join("output");
+        let first_season = source
+            .join("[Breeze] Dr. STONE [1080p BD][AV1][dual audio]")
+            .join("Season 01");
+        let second_season = source
+            .join("[Breeze] Dr. STONE [1080p BD][AV1][dual audio]")
+            .join("Season 02");
+        let fourth_season =
+            source.join("Dr.STONE.Science.Future.S04.1080p.WEBRip.EAC-3.Dual.Audio.AV1-Sokudo");
+        let third_season =
+            source.join("[Sokudo] Dr. STONE - New World - S03 v3 [1080p BD AV1][Dual Audio]");
+        std::fs::create_dir_all(&first_season).unwrap();
+        std::fs::create_dir_all(&second_season).unwrap();
+        std::fs::create_dir_all(&third_season).unwrap();
+        std::fs::create_dir_all(&fourth_season).unwrap();
+        std::fs::write(first_season.join("Dr. STONE - S01E01 - First.mkv"), b"one").unwrap();
+        std::fs::write(
+            second_season.join("Dr. STONE - S02E01 - Second.mkv"),
+            b"two",
+        )
+        .unwrap();
+        std::fs::write(
+            third_season.join("Dr. STONE - S03E01 - Third.mkv"),
+            b"three",
+        )
+        .unwrap();
+        std::fs::write(
+            fourth_season.join("Dr. STONE - S04E01 - Fourth.mkv"),
+            b"four",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 4);
+        for season in 1..=4 {
+            assert!(output.join(format!("Season {season}")).is_dir());
+        }
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Dr. STONE - First.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 2")
+                .join("[S02E01] Dr. STONE - Second.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 3")
+                .join("[S03E01] Dr. STONE - Third.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 4")
+                .join("[S04E01] Dr. STONE - Fourth.mkv")
+                .exists()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
