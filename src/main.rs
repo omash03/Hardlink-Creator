@@ -448,9 +448,9 @@ fn create_hard_links_with_blacklist(
 ///
 /// Direct files are handled before child directories because a folder may
 /// contain standalone movies alongside seasons. A child that contains nested
-/// season folders is flattened into the current output directory; an ordinary
-/// unnumbered child keeps its own name. Numbered and split-part season folders
-/// are grouped before episode links are created.
+/// season folders is flattened into the current output directory; an
+/// unnumbered child is treated as Season 1. Numbered and split-part season
+/// folders are grouped before episode links are created.
 fn create_hard_links_recursive(
     source_directory: &Path,
     output_directory: &Path,
@@ -503,8 +503,25 @@ fn create_hard_links_recursive(
                     output_directory.display()
                 )?;
                 output_directory.to_path_buf()
+            } else if is_ova_or_oad_folder(&season_name) {
+                let special_output_directory = output_directory.join(&season_name);
+                log_line!(
+                    log,
+                    "PRESERVE folder={} output={} reason=ova-or-oad",
+                    season_path.display(),
+                    special_output_directory.display()
+                )?;
+                special_output_directory
             } else {
-                output_directory.join(&season_name)
+                let assumed_season = season_destination_name(1);
+                let assumed_output_directory = output_directory.join(&assumed_season);
+                log_line!(
+                    log,
+                    "ASSUME season=1 source={} output={} reason=no-season-name",
+                    season_path.display(),
+                    assumed_output_directory.display()
+                )?;
+                assumed_output_directory
             };
             summary.add(create_hard_links_recursive(
                 &season_path,
@@ -531,7 +548,7 @@ fn create_hard_links_recursive(
             continue;
         }
 
-        let destination_name = season_destination_name(&season_entries, &grouped_indices);
+        let destination_name = season_destination_name(season_number);
         let destination_season = output_directory.join(destination_name);
         // Create the destination once for the whole logical season, including
         // all split-part source folders that were grouped above.
@@ -779,30 +796,12 @@ fn find_season_folder_group(
     Ok(Some((season_number, grouped_indices)))
 }
 
-/// Select the human-readable output folder name for a grouped season.
+/// Select the normalized output folder name for a grouped season.
 ///
-/// Part 1 is preferred because it normally carries the canonical release
-/// name. If no part 1 exists, an unmarked season folder is preferred, and the
-/// first grouped entry is the final fallback. The physical source folders are
-/// never renamed; this only chooses the destination directory name.
-fn season_destination_name(
-    entries: &[fs::DirEntry],
-    grouped_indices: &[usize],
-) -> std::ffi::OsString {
-    grouped_indices
-        .iter()
-        .find(|index| {
-            let name = entries[**index].file_name().to_string_lossy().into_owned();
-            season_folder_info(&name).part_number == Some(1)
-        })
-        .or_else(|| {
-            grouped_indices.iter().find(|index| {
-                let name = entries[**index].file_name().to_string_lossy().into_owned();
-                season_folder_info(&name).part_number.is_none()
-            })
-        })
-        .map(|index| entries[*index].file_name())
-        .unwrap_or_else(|| entries[grouped_indices[0]].file_name())
+/// The physical source folders are never renamed. Only the destination is
+/// normalized so every series root uses the same `Season N` layout.
+fn season_destination_name(season_number: u32) -> String {
+    format!("Season {season_number}")
 }
 
 /// Link video files that live directly in a directory rather than below a
@@ -1014,9 +1013,9 @@ fn read_directory_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
 /// `season_folder_info` before this fallback is used.
 fn extract_season_folder_number(name: &str) -> Option<u32> {
     let patterns = [
-        r"^(\d{1,3})(?:$|[ ._-]+)",
-        r"(?i)(?:^|[^a-z0-9])season[ ._-]*(\d{1,3})(?:$|[ ._-]+)",
-        r"(?i)(?:^|[^a-z0-9])s(\d{1,3})(?:$|[ ._-]+)",
+        r"^(\d{1,3})(?:$|[ ._()\-]+)",
+        r"(?i)(?:^|[^a-z0-9])season[ ._-]*(\d{1,3})(?:$|[ ._()\-]+)",
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,3})(?:$|[ ._()\-]+)",
     ];
 
     patterns.iter().find_map(|pattern| {
@@ -1026,6 +1025,20 @@ fn extract_season_folder_number(name: &str) -> Option<u32> {
             .and_then(|captures| captures.get(1))
             .and_then(|number| number.as_str().parse().ok())
     })
+}
+
+/// Return whether an unnumbered folder is explicitly for OVA/OAD material.
+///
+/// These folders are not regular seasons and should retain their source name
+/// instead of being assigned the Season 1 fallback.
+fn is_ova_or_oad_folder(name: &str) -> bool {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "ova" | "ovas" | "oad" | "oads"
+            )
+        })
 }
 
 /// Parsed metadata used when comparing and grouping season folders.
@@ -1272,12 +1285,14 @@ fn corrected_file_name(
 mod tests {
     use super::{
         corrected_file_name, extract_episode_number, extract_season_and_episode,
-        extract_season_and_part_number, extract_season_folder_number,
+        extract_season_and_part_number, extract_season_folder_number, is_ova_or_oad_folder,
     };
 
     #[test]
     fn extracts_common_season_folder_names() {
         assert_eq!(extract_season_folder_number("Season 01"), Some(1));
+        assert_eq!(extract_season_folder_number("Season 0"), Some(0));
+        assert_eq!(extract_season_folder_number("Show (Season 05)"), Some(5));
         assert_eq!(extract_season_folder_number("S02"), Some(2));
         assert_eq!(
             extract_season_folder_number("[Author] Show Name - S03 v2 [1080p AV1][Dual Audio]"),
@@ -1291,6 +1306,13 @@ mod tests {
         assert_eq!(extract_season_folder_number("13 - Show name S1"), Some(13));
         assert_eq!(extract_season_folder_number("Specials"), None);
         assert_eq!(extract_season_folder_number("Release S01+02+Movie"), None);
+    }
+
+    #[test]
+    fn recognizes_ova_and_oad_folder_names() {
+        assert!(is_ova_or_oad_folder("OVA"));
+        assert!(is_ova_or_oad_folder("Show OADs"));
+        assert!(!is_ova_or_oad_folder("Showcase"));
     }
 
     #[test]
@@ -1397,9 +1419,9 @@ mod tests {
 
         assert_eq!(summary.linked, 1);
         assert_eq!(summary.skipped, 2);
-        assert!(output.join("Season 01").join("[S01E01] Show.mkv").exists());
-        assert!(!output.join("Season 01").join("sample.mkv").exists());
-        assert!(!output.join("Season 02").exists());
+        assert!(output.join("Season 1").join("[S01E01] Show.mkv").exists());
+        assert!(!output.join("Season 1").join("sample.mkv").exists());
+        assert!(!output.join("Season 2").exists());
         let log_contents = std::fs::read_to_string(root.join("changes.log")).unwrap();
         assert!(log_contents.contains("SKIP file="));
         assert!(log_contents.contains("sample.mkv"));
@@ -1430,13 +1452,11 @@ mod tests {
 
         assert_eq!(summary.linked, 1);
         assert_eq!(summary.skipped, 1);
-        let linked_file = output
-            .join("The Beginning")
-            .join("The Beginning Episode.mkv");
+        let linked_file = output.join("Season 1").join("The Beginning Episode.mkv");
         assert_eq!(std::fs::read(&linked_file).unwrap(), b"episode");
         assert!(
             !output
-                .join("The Beginning")
+                .join("Season 1")
                 .join("The Beginning Episode.nfo")
                 .exists()
         );
@@ -1445,6 +1465,102 @@ mod tests {
             std::fs::read(season.join("The Beginning Episode.mkv")).unwrap(),
             b"updated"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalizes_parenthesized_season_folder_names() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-parenthesized-season-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let season = source.join("Show (Season 05)");
+        let output = root.join("output");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("Show - S05E01 - Episode.mkv"), b"episode").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 1);
+        assert!(
+            output
+                .join("Season 5")
+                .join("[S05E01] Show - Episode.mkv")
+                .exists()
+        );
+        assert!(!output.join("Show (Season 05)").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assumes_season_one_for_a_release_folder_without_a_season_name() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-missing-season-name-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let release_folder = source.join("[Author] Show name [1080p BD][AV1][dual audio]");
+        let output = root.join("output");
+        std::fs::create_dir_all(&release_folder).unwrap();
+        std::fs::write(
+            release_folder.join("Show name - S01E01 - Episode.mkv"),
+            b"episode",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 1);
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show name - Episode.mkv")
+                .exists()
+        );
+        assert!(!output.join("[Author] Show name [1080p BD][AV1][dual audio]").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_ova_folder_and_explicit_season_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-ova-season-zero-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let season_zero = source.join("Season 0");
+        let ova = source.join("OVA");
+        let output = root.join("output");
+        std::fs::create_dir_all(&season_zero).unwrap();
+        std::fs::create_dir_all(&ova).unwrap();
+        std::fs::write(season_zero.join("Show - S00E01 - Prologue.mkv"), b"season zero")
+            .unwrap();
+        std::fs::write(ova.join("Show OVA 01.mkv"), b"ova").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 2);
+        assert!(
+            output
+                .join("Season 0")
+                .join("[S00E01] Show - Prologue.mkv")
+                .exists()
+        );
+        assert!(output.join("OVA").join("Show OVA 01.mkv").exists());
+        assert!(!output.join("Season 1").exists());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1605,17 +1721,17 @@ mod tests {
 
         assert_eq!(summary.linked, 2);
         assert_eq!(summary.skipped, 2);
-        let linked_file = output.join("Season 01").join("[S01E01] Show - Title.mkv");
+        let linked_file = output.join("Season 1").join("[S01E01] Show - Title.mkv");
         assert_eq!(std::fs::read(&linked_file).unwrap(), b"episode");
         assert!(
             output
-                .join("Season 01")
+                .join("Season 1")
                 .join("[S01E02] Show - Episode.mkv")
                 .exists()
         );
         assert!(
             !output
-                .join("Season 01")
+                .join("Season 1")
                 .join("[S01E02] Show - Metadata.nfo")
                 .exists()
         );
@@ -1662,14 +1778,14 @@ mod tests {
         assert!(
             output_root
                 .join("First Show")
-                .join("Season 01")
+                .join("Season 1")
                 .join("[S01E01] First Show - Title.mkv")
                 .exists()
         );
         assert!(
             output_root
                 .join("Second Show")
-                .join("Season 02")
+                .join("Season 2")
                 .join("[S02E03] Second Show - Return.mkv")
                 .exists()
         );
@@ -1701,7 +1817,7 @@ mod tests {
         assert!(
             output_root
                 .join("Show")
-                .join("Season 01")
+                .join("Season 1")
                 .join("[S01E01] Show - Episode.mkv")
                 .exists()
         );
@@ -1747,13 +1863,13 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         assert!(
             output
-                .join("Season 01")
+                .join("Season 1")
                 .join("[S01E01] Show - Title.mkv")
                 .exists()
         );
         assert!(
             output
-                .join("Season 02")
+                .join("Season 2")
                 .join("[S02E01] Show - Return.mkv")
                 .exists()
         );
@@ -1797,7 +1913,7 @@ mod tests {
 
         let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
 
-        let unified_output = output.join(first_part.file_name().unwrap());
+        let unified_output = output.join("Season 2");
         assert_eq!(summary.linked, 2);
         assert_eq!(summary.skipped, 0);
         assert!(
