@@ -1898,32 +1898,33 @@ mod tests {
         let source = root.join("source");
         let output = root.join("output");
         let first_season = source
-            .join("[Breeze] Dr. STONE [1080p BD][AV1][dual audio]")
+            .join("[Source] Example Series [1080p BD][AV1][dual audio]")
             .join("Season 01");
         let second_season = source
-            .join("[Breeze] Dr. STONE [1080p BD][AV1][dual audio]")
+            .join("[Source] Example Series [1080p BD][AV1][dual audio]")
             .join("Season 02");
         let fourth_season =
-            source.join("Dr.STONE.Science.Future.S04.1080p.WEBRip.EAC-3.Dual.Audio.AV1-Sokudo");
+            source.join("Example.Series.Future.S04.1080p.WEBRip.EAC-3.Dual.Audio.AV1-Source");
         let third_season =
-            source.join("[Sokudo] Dr. STONE - New World - S03 v3 [1080p BD AV1][Dual Audio]");
+            source.join("[Source] Example Series - Third Arc - S03 v3 [1080p BD AV1][Dual Audio]");
         std::fs::create_dir_all(&first_season).unwrap();
         std::fs::create_dir_all(&second_season).unwrap();
         std::fs::create_dir_all(&third_season).unwrap();
         std::fs::create_dir_all(&fourth_season).unwrap();
-        std::fs::write(first_season.join("Dr. STONE - S01E01 - First.mkv"), b"one").unwrap();
+        std::fs::write(first_season.join("Example Series - S01E01 - First.mkv"), b"one")
+            .unwrap();
         std::fs::write(
-            second_season.join("Dr. STONE - S02E01 - Second.mkv"),
+            second_season.join("Example Series - S02E01 - Second.mkv"),
             b"two",
         )
         .unwrap();
         std::fs::write(
-            third_season.join("Dr. STONE - S03E01 - Third.mkv"),
+            third_season.join("Example Series - S03E01 - Third.mkv"),
             b"three",
         )
         .unwrap();
         std::fs::write(
-            fourth_season.join("Dr. STONE - S04E01 - Fourth.mkv"),
+            fourth_season.join("Example Series - S04E01 - Fourth.mkv"),
             b"four",
         )
         .unwrap();
@@ -1939,25 +1940,25 @@ mod tests {
         assert!(
             output
                 .join("Season 1")
-                .join("[S01E01] Dr. STONE - First.mkv")
+                .join("[S01E01] Example Series - First.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 2")
-                .join("[S02E01] Dr. STONE - Second.mkv")
+                .join("[S02E01] Example Series - Second.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 3")
-                .join("[S03E01] Dr. STONE - Third.mkv")
+                .join("[S03E01] Example Series - Third.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 4")
-                .join("[S04E01] Dr. STONE - Fourth.mkv")
+                .join("[S04E01] Example Series - Fourth.mkv")
                 .exists()
         );
 
