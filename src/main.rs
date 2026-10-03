@@ -190,12 +190,8 @@ fn run() -> Result<()> {
         )
     })?;
     let log_directory = application_directory.join(LOG_DIRECTORY_NAME);
-    fs::create_dir_all(&log_directory).with_context(|| {
-        format!(
-            "Could not create log directory {}",
-            log_directory.display()
-        )
-    })?;
+    fs::create_dir_all(&log_directory)
+        .with_context(|| format!("Could not create log directory {}", log_directory.display()))?;
 
     println!(
         "Watching for new files; scanning every {} second(s). Press Ctrl+C to stop.",
@@ -488,22 +484,27 @@ fn create_hard_links_recursive(
         }
 
         let season_name = season_entry.file_name().to_string_lossy().into_owned();
+        if contains_season_folder(&season_path)? {
+            log_line!(
+                log,
+                "FLATTEN source={} output={} reason=nested-season-folders",
+                season_path.display(),
+                output_directory.display()
+            )?;
+            summary.add(create_hard_links_recursive(
+                &season_path,
+                output_directory,
+                seasons_seen,
+                log,
+                blacklist,
+            )?);
+            continue;
+        }
+
         let Some((season_number, grouped_indices)) =
             find_season_folder_group(&season_entries, season_index)?
         else {
-            let contains_nested_seasons = contains_season_folder(&season_path)?;
-            // Wrapper/release folders are presentation details. Flatten only
-            // when a nested season proves that preserving the wrapper would
-            // add an unwanted level to the media-server layout.
-            let nested_output_directory = if contains_nested_seasons {
-                log_line!(
-                    log,
-                    "FLATTEN source={} output={} reason=nested-season-folders",
-                    season_path.display(),
-                    output_directory.display()
-                )?;
-                output_directory.to_path_buf()
-            } else if is_ova_or_oad_folder(&season_name) {
+            let nested_output_directory = if is_ova_or_oad_folder(&season_name) {
                 let special_output_directory = output_directory.join(&season_name);
                 log_line!(
                     log,
@@ -1530,7 +1531,11 @@ mod tests {
                 .join("[S01E01] Show name - Episode.mkv")
                 .exists()
         );
-        assert!(!output.join("[Author] Show name [1080p BD][AV1][dual audio]").exists());
+        assert!(
+            !output
+                .join("[Author] Show name [1080p BD][AV1][dual audio]")
+                .exists()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1548,8 +1553,11 @@ mod tests {
         let output = root.join("output");
         std::fs::create_dir_all(&season_zero).unwrap();
         std::fs::create_dir_all(&ova).unwrap();
-        std::fs::write(season_zero.join("Show - S00E01 - Prologue.mkv"), b"season zero")
-            .unwrap();
+        std::fs::write(
+            season_zero.join("Show - S00E01 - Prologue.mkv"),
+            b"season zero",
+        )
+        .unwrap();
         std::fs::write(ova.join("Show OVA 01.mkv"), b"ova").unwrap();
         std::fs::create_dir_all(&output).unwrap();
         let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
@@ -1889,6 +1897,53 @@ mod tests {
     }
 
     #[test]
+    fn flattens_multi_season_bundle_with_season_markers_in_its_name() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-multi-season-bundle-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source").join("Show");
+        let bundle = source.join("[Author2] Show S01 S02 [1080p BD AV1][dual audio]");
+        let output = root.join("output").join("Show");
+        let season_one = bundle.join("Season 01");
+        let season_two = bundle.join("Season 02");
+        let season_three = source.join("[Author1] Show - S03 [WEB.1080p.AV1]");
+        std::fs::create_dir_all(bundle.join("Season 00")).unwrap();
+        std::fs::create_dir_all(&season_one).unwrap();
+        std::fs::create_dir_all(&season_two).unwrap();
+        std::fs::create_dir_all(&season_three).unwrap();
+        std::fs::write(season_one.join("Show - S01E01 - First.mkv"), b"season one").unwrap();
+        std::fs::write(season_two.join("Show - S02E01 - Second.mkv"), b"season two").unwrap();
+        std::fs::write(
+            season_three.join("Show - S03E01 - Third.mkv"),
+            b"season three",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 3);
+        assert_eq!(summary.skipped, 0);
+        for season in 1..=3 {
+            assert!(
+                output
+                    .join(format!("Season {season}"))
+                    .join(format!(
+                        "[S{season:02}E01] Show - {}.mkv",
+                        ["First", "Second", "Third"][(season - 1) as usize]
+                    ))
+                    .exists()
+            );
+        }
+        assert!(!output.join(bundle.file_name().unwrap()).exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn does_not_skip_nested_seasons_that_share_a_title_with_later_seasons() {
         let root = std::env::temp_dir().join(format!(
             "metadata-corrector-shared-title-nested-seasons-test-{}",
@@ -1911,8 +1966,11 @@ mod tests {
         std::fs::create_dir_all(&second_season).unwrap();
         std::fs::create_dir_all(&third_season).unwrap();
         std::fs::create_dir_all(&fourth_season).unwrap();
-        std::fs::write(first_season.join("Example Series - S01E01 - First.mkv"), b"one")
-            .unwrap();
+        std::fs::write(
+            first_season.join("Example Series - S01E01 - First.mkv"),
+            b"one",
+        )
+        .unwrap();
         std::fs::write(
             second_season.join("Example Series - S02E01 - Second.mkv"),
             b"two",
