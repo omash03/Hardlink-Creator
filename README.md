@@ -14,12 +14,15 @@ files are ignored.
 - Scan one configured source folder, or batch-process each immediate
   subfolder of a source root into a matching destination folder.
 - Recognize common season-folder and episode-filename conventions, including
-  `Season 2`, `S02`, `S02 P2`, `S01E02`, `1x02`, and `Episode 02`.
+  `Season 2`, `S02`, `S02 P2`, `S01E02`, `1x02`, and `Episode 02`, with
+  episode numbers up to four digits.
 - Group split season folders, flatten wrapper folders that contain nested
   seasons, and skip duplicate season or episode numbers deterministically.
 - Create normalized episode names in the form
-  `[SxxEyy] Title.extension`. Direct video files with an `SxxEyy` marker are
-  normalized as well; other direct video files keep their original name.
+  `[SxxEyy] Title - yy.extension`, retaining the episode number in the title
+  body and its original zero-padding. Direct video files with an `SxxEyy`
+  marker are normalized as well; other direct video files keep their original
+  name.
 - Filter video files by extension (case-insensitively) and skip configured
   blacklist matches.
 - Re-scan periodically, skipping existing destinations and links so repeat

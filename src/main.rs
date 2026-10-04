@@ -1203,11 +1203,15 @@ fn is_video_file(path: &Path) -> bool {
 /// chance that a title number is chosen when a structured episode marker is
 /// present.
 fn extract_episode_number(stem: &str) -> Option<u32> {
+    extract_episode_number_with_text(stem).map(|(number, _)| number)
+}
+
+fn extract_episode_number_with_text(stem: &str) -> Option<(u32, String)> {
     let patterns = [
-        r"(?i)\bS\d{1,3}E(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)",
-        r"(?i)\b\d{1,3}x(\d{1,3})\b",
-        r"(?i)\b(?:episode|ep)[ ._-]*(\d{1,3})\b",
-        r"(?:^|[ ._-])(\d{1,3})(?:[ ._-]|$)",
+        r"(?i)\bS\d{1,3}E(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
+        r"(?i)\b\d{1,3}x(\d{1,4})\b",
+        r"(?i)\b(?:episode|ep)[ ._-]*(\d{1,4})\b",
+        r"(?:^|[ ._-])(\d{1,4})(?:[ ._-]|$)",
     ];
 
     patterns.iter().find_map(|pattern| {
@@ -1215,7 +1219,7 @@ fn extract_episode_number(stem: &str) -> Option<u32> {
             .ok()?
             .captures(stem)
             .and_then(|captures| captures.get(1))
-            .and_then(|number| number.as_str().parse().ok())
+            .and_then(|number| Some((number.as_str().parse().ok()?, number.as_str().to_owned())))
     })
 }
 
@@ -1225,7 +1229,7 @@ fn extract_episode_number(stem: &str) -> Option<u32> {
 /// the season number. Other filename styles can provide an episode number but
 /// do not provide enough context to safely normalize the season.
 fn extract_season_and_episode(stem: &str) -> Option<(u32, u32)> {
-    Regex::new(r"(?i)\bS(\d{1,3})E(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)")
+    Regex::new(r"(?i)\bS(\d{1,3})E(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)")
         .ok()?
         .captures(stem)
         .and_then(|captures| {
@@ -1236,35 +1240,38 @@ fn extract_season_and_episode(stem: &str) -> Option<(u32, u32)> {
         })
 }
 
-/// Construct the canonical `[SxxEyy] Title.extension` destination filename.
+/// Construct the canonical `[SxxEyy] Title - yy.extension` destination filename.
 ///
-/// Existing season/episode markers and a matching standalone episode number
-/// are removed from the title, while release metadata such as uploader and
-/// quality tags is retained. Whitespace and repeated separators are cleaned
-/// after removal so the generated name is stable across polling passes.
+/// Episode markers are reduced to their number in the title body, retaining
+/// any leading zeroes; release metadata such as uploader and quality tags is
+/// retained as well.
 fn corrected_file_name(
     stem: &str,
     season: u32,
     episode: u32,
     extension: Option<&std::ffi::OsStr>,
 ) -> String {
+    let episode_number_text = extract_episode_number_with_text(stem)
+        .filter(|(number, _)| *number == episode)
+        .map(|(_, text)| text);
+    let episode_text = episode_number_text
+        .clone()
+        .unwrap_or_else(|| format!("{episode:02}"));
     let mut title = stem.to_owned();
-    if let Ok(regex) = Regex::new(r"(?i)\bS\d{1,3}E\d{1,3}(v\d+)?") {
-        title = regex.replace_all(&title, "$1").into_owned();
-    }
     let patterns = [
-        r"(?i)\bseason[ ._-]*\d{1,3}[ ._-]*(?:episode|ep|e)[ ._-]*\d{1,3}\b",
-        r"(?i)\b\d{1,3}x\d{1,3}\b",
-        r"(?i)\b(?:season|s)[ ._-]*\d{1,3}\b",
-        r"(?i)\b(?:episode|ep|e)[ ._-]*\d{1,3}\b",
+        (r"(?i)\bS\d{1,3}E(\d{1,4})(v\d+)?", "$1$2"),
+        (
+            r"(?i)\bseason[ ._-]*\d{1,3}[ ._-]*(?:episode|ep|e)[ ._-]*(\d{1,4})\b",
+            "$1",
+        ),
+        (r"(?i)\b\d{1,3}x(\d{1,4})\b", "$1"),
+        (r"(?i)\b(?:season|s)[ ._-]*\d{1,3}\b", ""),
+        (r"(?i)\b(?:episode|ep|e)[ ._-]*(\d{1,4})\b", "$1"),
     ];
-    for pattern in patterns {
+    for (pattern, replacement) in patterns {
         if let Ok(regex) = Regex::new(pattern) {
-            title = regex.replace_all(&title, "").into_owned();
+            title = regex.replace_all(&title, replacement).into_owned();
         }
-    }
-    if let Ok(regex) = Regex::new(&format!(r"(?i)(^|[ ._\-\[\(])0*{}($|[ ._\-\]\)])", episode)) {
-        title = regex.replace_all(&title, "$1$2").into_owned();
     }
 
     if let Ok(regex) = Regex::new(r"\s*[-_.]\s*[-_.]\s*") {
@@ -1276,13 +1283,23 @@ fn corrected_file_name(
         .join(" ")
         .trim_matches(&[' ', '-', '_', '.'][..])
         .to_owned();
-    let title = if title.is_empty() { "Episode" } else { &title };
+    let mut title = if title.is_empty() {
+        String::from("Episode")
+    } else {
+        title
+    };
+    if episode_number_text.is_none() {
+        title.push_str(" - ");
+        title.push_str(&episode_text);
+    }
     let extension = extension
         .and_then(|value| value.to_str())
         .map(|value| format!(".{value}"))
         .unwrap_or_default();
 
-    format!("[S{season:02}E{episode:02}] {title}{extension}")
+    let episode_width = episode_text.len().max(2);
+    let episode_label = format!("{episode:0episode_width$}");
+    format!("[S{season:02}E{episode_label}] {title}{extension}")
 }
 
 /// Unit tests for configuration, parsing, traversal, and hard-link behavior.
@@ -1424,7 +1441,12 @@ mod tests {
 
         assert_eq!(summary.linked, 1);
         assert_eq!(summary.skipped, 2);
-        assert!(output.join("Season 1").join("[S01E01] Show.mkv").exists());
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show - 01.mkv")
+                .exists()
+        );
         assert!(!output.join("Season 1").join("sample.mkv").exists());
         assert!(!output.join("Season 2").exists());
         let log_contents = std::fs::read_to_string(root.join("changes.log")).unwrap();
@@ -1495,7 +1517,7 @@ mod tests {
         assert!(
             output
                 .join("Season 5")
-                .join("[S05E01] Show - Episode.mkv")
+                .join("[S05E01] Show - 01 - Episode.mkv")
                 .exists()
         );
         assert!(!output.join("Show (Season 05)").exists());
@@ -1528,7 +1550,7 @@ mod tests {
         assert!(
             output
                 .join("Season 1")
-                .join("[S01E01] Show name - Episode.mkv")
+                .join("[S01E01] Show name - 01 - Episode.mkv")
                 .exists()
         );
         assert!(
@@ -1568,7 +1590,7 @@ mod tests {
         assert!(
             output
                 .join("Season 0")
-                .join("[S00E01] Show - Prologue.mkv")
+                .join("[S00E01] Show - 01 - Prologue.mkv")
                 .exists()
         );
         assert!(output.join("OVA").join("Show OVA 01.mkv").exists());
@@ -1618,9 +1640,29 @@ mod tests {
         assert_eq!(extract_episode_number("Show 2x08 Title"), Some(8));
         assert_eq!(extract_episode_number("Show - Episode 09"), Some(9));
         assert_eq!(extract_episode_number("Show - 10"), Some(10));
+        assert_eq!(extract_episode_number("Show - 0439 - Title"), Some(439));
+        assert_eq!(
+            extract_episode_number("Show - S01E1000 - Title"),
+            Some(1000)
+        );
+        assert_eq!(extract_episode_number("Show 2x1000 Title"), Some(1000));
+        assert_eq!(extract_episode_number("Show - Episode 1000"), Some(1000));
         assert_eq!(
             extract_season_and_episode("[author] Show Name - S05E11v2"),
             Some((5, 11))
+        );
+        assert_eq!(
+            extract_season_and_episode("Show - S01E1000 - Title"),
+            Some((1, 1000))
+        );
+        assert_eq!(
+            corrected_file_name(
+                "Show - 0439 - Title",
+                13,
+                439,
+                Some(std::ffi::OsStr::new("mkv")),
+            ),
+            "[S13E0439] Show - 0439 - Title.mkv"
         );
     }
 
@@ -1634,7 +1676,7 @@ mod tests {
         let source = root.join("source");
         let output = root.join("output");
         let original_name = "[author] Show Name - S05E11v2.mkv";
-        let normalized_name = "[S05E11] [author] Show Name - v2.mkv";
+        let normalized_name = "[S05E11] [author] Show Name - 11v2.mkv";
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(original_name), b"episode").unwrap();
         std::fs::create_dir_all(&output).unwrap();
@@ -1661,7 +1703,7 @@ mod tests {
         let source = root.join("source");
         let output = root.join("output");
         let original_name = "[Author] Show Name - 07 [1080p BD][AV1][dual audio].mkv";
-        let normalized_name = "[S01E07] [Author] Show Name - [1080p BD][AV1][dual audio].mkv";
+        let normalized_name = "[S01E07] [Author] Show Name - 07 [1080p BD][AV1][dual audio].mkv";
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(original_name), b"episode").unwrap();
         std::fs::create_dir_all(&output).unwrap();
@@ -1687,20 +1729,20 @@ mod tests {
                 7,
                 Some(std::ffi::OsStr::new("mkv")),
             ),
-            "[S02E07] Show - The Beginning.mkv"
+            "[S02E07] Show - 07 - The Beginning.mkv"
         );
         assert_eq!(
             corrected_file_name("Show - 10", 1, 10, Some(std::ffi::OsStr::new("mkv")),),
-            "[S01E10] Show.mkv"
+            "[S01E10] Show - 10.mkv"
         );
         assert_eq!(
             corrected_file_name(
-                "[Uploader] Some Show 3rd [1080p AV1 10Bit][AAC][MultiSubs]",
+                "[Uploader] Some Show 3rd - 01 [1080p AV1 10Bit][AAC][MultiSubs]",
                 3,
                 1,
                 Some(std::ffi::OsStr::new("mkv")),
             ),
-            "[S03E01] [Uploader] Some Show 3rd [1080p AV1 10Bit][AAC][MultiSubs].mkv"
+            "[S03E01] [Uploader] Some Show 3rd - 01 [1080p AV1 10Bit][AAC][MultiSubs].mkv"
         );
         assert_eq!(
             corrected_file_name(
@@ -1709,7 +1751,7 @@ mod tests {
                 1,
                 Some(std::ffi::OsStr::new("mkv")),
             ),
-            "[S05E01] [Author] Some Show - v2.mkv"
+            "[S05E01] [Judas] Rent-a-Girlfriend - 01v2.mkv"
         );
     }
 
@@ -1722,7 +1764,7 @@ mod tests {
         let season = source.join("Season 01");
         let output = root.join("output");
         std::fs::create_dir_all(&season).unwrap();
-        std::fs::write(season.join("Show - S01E01 - Pilot.mkv"), b"episode").unwrap();
+        std::fs::write(season.join("Show - S01E01 - Title.mkv"), b"episode").unwrap();
         std::fs::write(season.join("Show - S01E01 - Z-duplicate.mkv"), b"duplicate").unwrap();
         std::fs::write(season.join("Show - S01E02 - Metadata.nfo"), b"metadata").unwrap();
         std::fs::write(season.join("Show - S01E02 - Episode.mkv"), b"episode 2").unwrap();
@@ -1733,12 +1775,14 @@ mod tests {
 
         assert_eq!(summary.linked, 2);
         assert_eq!(summary.skipped, 2);
-        let linked_file = output.join("Season 1").join("[S01E01] Show - Title.mkv");
+        let linked_file = output
+            .join("Season 1")
+            .join("[S01E01] Show - 01 - Title.mkv");
         assert_eq!(std::fs::read(&linked_file).unwrap(), b"episode");
         assert!(
             output
                 .join("Season 1")
-                .join("[S01E02] Show - Episode.mkv")
+                .join("[S01E02] Show - 02 - Episode.mkv")
                 .exists()
         );
         assert!(
@@ -1791,14 +1835,14 @@ mod tests {
             output_root
                 .join("First Show")
                 .join("Season 1")
-                .join("[S01E01] First Show - Title.mkv")
+                .join("[S01E01] First Show - 01 - Title.mkv")
                 .exists()
         );
         assert!(
             output_root
                 .join("Second Show")
                 .join("Season 2")
-                .join("[S02E03] Second Show - Return.mkv")
+                .join("[S02E03] Second Show - 03 - Return.mkv")
                 .exists()
         );
 
@@ -1830,7 +1874,7 @@ mod tests {
             output_root
                 .join("Show")
                 .join("Season 1")
-                .join("[S01E01] Show - Episode.mkv")
+                .join("[S01E01] Show - 01 - Episode.mkv")
                 .exists()
         );
         std::fs::write(output_root.join("Movie.mkv"), b"updated").unwrap();
@@ -1876,13 +1920,13 @@ mod tests {
         assert!(
             output
                 .join("Season 1")
-                .join("[S01E01] Show - Title.mkv")
+                .join("[S01E01] Show - 01 - Title.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 2")
-                .join("[S02E01] Show - Return.mkv")
+                .join("[S02E01] Show - 01 - Return.mkv")
                 .exists()
         );
         assert!(!output.join("Release S01+02+Movie").exists());
@@ -1932,7 +1976,7 @@ mod tests {
                 output
                     .join(format!("Season {season}"))
                     .join(format!(
-                        "[S{season:02}E01] Show - {}.mkv",
+                        "[S{season:02}E01] Show - 01 - {}.mkv",
                         ["First", "Second", "Third"][(season - 1) as usize]
                     ))
                     .exists()
@@ -1998,25 +2042,25 @@ mod tests {
         assert!(
             output
                 .join("Season 1")
-                .join("[S01E01] Example Series - First.mkv")
+                .join("[S01E01] Example Series - 01 - First.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 2")
-                .join("[S02E01] Example Series - Second.mkv")
+                .join("[S02E01] Example Series - 01 - Second.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 3")
-                .join("[S03E01] Example Series - Third.mkv")
+                .join("[S03E01] Example Series - 01 - Third.mkv")
                 .exists()
         );
         assert!(
             output
                 .join("Season 4")
-                .join("[S04E01] Example Series - Fourth.mkv")
+                .join("[S04E01] Example Series - 01 - Fourth.mkv")
                 .exists()
         );
 
@@ -2057,12 +2101,12 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         assert!(
             unified_output
-                .join("[S02E01] Show Name II - First Part.mkv")
+                .join("[S02E01] Show Name II - 01 - First Part.mkv")
                 .exists()
         );
         assert!(
             unified_output
-                .join("[S02E02] Show Name II - Second Part.mkv")
+                .join("[S02E02] Show Name II - 02 - Second Part.mkv")
                 .exists()
         );
         assert!(!output.join(second_part.file_name().unwrap()).exists());
