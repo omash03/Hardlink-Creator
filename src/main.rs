@@ -504,11 +504,11 @@ fn create_hard_links_recursive(
         let Some((season_number, grouped_indices)) =
             find_season_folder_group(&season_entries, season_index)?
         else {
-            let nested_output_directory = if is_ova_or_oad_folder(&season_name) {
+            let nested_output_directory = if is_special_media_folder(&season_name) {
                 let special_output_directory = output_directory.join(&season_name);
                 log_line!(
                     log,
-                    "PRESERVE folder={} output={} reason=ova-or-oad",
+                    "PRESERVE folder={} output={} reason=special-media-folder",
                     season_path.display(),
                     special_output_directory.display()
                 )?;
@@ -1032,16 +1032,16 @@ fn extract_season_folder_number(name: &str) -> Option<u32> {
     })
 }
 
-/// Return whether an unnumbered folder is explicitly for OVA/OAD material.
+/// Return whether an unnumbered folder is explicitly for special media.
 ///
 /// These folders are not regular seasons and should retain their source name
 /// instead of being assigned the Season 1 fallback.
-fn is_ova_or_oad_folder(name: &str) -> bool {
+fn is_special_media_folder(name: &str) -> bool {
     name.split(|character: char| !character.is_ascii_alphanumeric())
         .any(|part| {
             matches!(
                 part.to_ascii_lowercase().as_str(),
-                "ova" | "ovas" | "oad" | "oads"
+                "ova" | "ovas" | "oad" | "oads" | "movie" | "movies" | "special" | "specials"
             )
         })
 }
@@ -1199,9 +1199,10 @@ fn is_video_file(path: &Path) -> bool {
 /// Extract an episode number from common release filename formats.
 ///
 /// Patterns are ordered from most explicit to most permissive: `S01E02`,
-/// `1x02`, `Episode 02`, and finally a separated number. The order reduces the
-/// chance that a title number is chosen when a structured episode marker is
-/// present.
+/// `1x02`, `Episode 02`, and finally a separated number. Release revision
+/// suffixes such as `v2` are accepted but excluded from the episode number.
+/// The order reduces the chance that a title number is chosen when a
+/// structured episode marker is present.
 fn extract_episode_number(stem: &str) -> Option<u32> {
     extract_episode_number_with_text(stem).map(|(number, _)| number)
 }
@@ -1209,9 +1210,9 @@ fn extract_episode_number(stem: &str) -> Option<u32> {
 fn extract_episode_number_with_text(stem: &str) -> Option<(u32, String)> {
     let patterns = [
         r"(?i)\bS\d{1,3}E(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
-        r"(?i)\b\d{1,3}x(\d{1,4})\b",
-        r"(?i)\b(?:episode|ep)[ ._-]*(\d{1,4})\b",
-        r"(?:^|[ ._-])(\d{1,4})(?:[ ._-]|$)",
+        r"(?i)\b\d{1,3}x(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
+        r"(?i)\b(?:episode|ep)[ ._-]*(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
+        r"(?:^|[ ._-])(\d{1,4})(?:v\d+)?(?:[ ._-]|$)",
     ];
 
     patterns.iter().find_map(|pattern| {
@@ -1259,14 +1260,18 @@ fn corrected_file_name(
         .unwrap_or_else(|| format!("{episode:02}"));
     let mut title = stem.to_owned();
     let patterns = [
-        (r"(?i)\bS\d{1,3}E(\d{1,4})(v\d+)?", "$1$2"),
+        (r"(?i)\bS\d{1,3}E(\d{1,4})(?:v\d+)?", "$1"),
         (
-            r"(?i)\bseason[ ._-]*\d{1,3}[ ._-]*(?:episode|ep|e)[ ._-]*(\d{1,4})\b",
+            r"(?i)\bseason[ ._-]*\d{1,3}[ ._-]*(?:episode|ep|e)[ ._-]*(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
             "$1",
         ),
-        (r"(?i)\b\d{1,3}x(\d{1,4})\b", "$1"),
+        (r"(?i)\b\d{1,3}x(\d{1,4})(?:v\d+)?", "$1"),
         (r"(?i)\b(?:season|s)[ ._-]*\d{1,3}\b", ""),
-        (r"(?i)\b(?:episode|ep|e)[ ._-]*(\d{1,4})\b", "$1"),
+        (
+            r"(?i)\b(?:episode|ep|e)[ ._-]*(\d{1,4})(?:v\d+)?(?:[^a-z0-9]|$)",
+            "$1",
+        ),
+        (r"(?i)(\d{1,4})v\d+(?:([ ._-])|$)", "$1$2"),
     ];
     for (pattern, replacement) in patterns {
         if let Ok(regex) = Regex::new(pattern) {
@@ -1307,7 +1312,7 @@ fn corrected_file_name(
 mod tests {
     use super::{
         corrected_file_name, extract_episode_number, extract_season_and_episode,
-        extract_season_and_part_number, extract_season_folder_number, is_ova_or_oad_folder,
+        extract_season_and_part_number, extract_season_folder_number, is_special_media_folder,
     };
 
     #[test]
@@ -1331,10 +1336,12 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_ova_and_oad_folder_names() {
-        assert!(is_ova_or_oad_folder("OVA"));
-        assert!(is_ova_or_oad_folder("Show OADs"));
-        assert!(!is_ova_or_oad_folder("Showcase"));
+    fn recognizes_special_media_folder_names() {
+        assert!(is_special_media_folder("OVA"));
+        assert!(is_special_media_folder("Show OADs"));
+        assert!(is_special_media_folder("Show Movies"));
+        assert!(is_special_media_folder("[Release] Show Specials"));
+        assert!(!is_special_media_folder("Showcase"));
     }
 
     #[test]
@@ -1600,6 +1607,59 @@ mod tests {
     }
 
     #[test]
+    fn preserves_movie_and_special_folders_beside_nested_seasons() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-movie-special-folders-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source").join("Show");
+        let release = source.join("[Release] Show (Complete Collection)");
+        let first_season = release.join("Season 01");
+        let second_season = release.join("Season 02");
+        let movies = release.join("[Release] Show Movies");
+        let specials = release.join("[Release] Show Specials");
+        let output = root.join("output").join("Show");
+        std::fs::create_dir_all(&first_season).unwrap();
+        std::fs::create_dir_all(&second_season).unwrap();
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::create_dir_all(&specials).unwrap();
+        std::fs::write(first_season.join("Show - S01E01.mkv"), b"episode 1").unwrap();
+        std::fs::write(second_season.join("Show - S02E01.mkv"), b"episode 2").unwrap();
+        std::fs::write(movies.join("Show Movie.mkv"), b"movie").unwrap();
+        std::fs::write(specials.join("Show Special.mkv"), b"special").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 4);
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show - 01.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 2")
+                .join("[S02E01] Show - 01.mkv")
+                .exists()
+        );
+        assert!(output.join("[Release] Show Movies").join("Show Movie.mkv").exists());
+        assert!(
+            output
+                .join("[Release] Show Specials")
+                .join("Show Special.mkv")
+                .exists()
+        );
+        assert!(!output.join("Season 1").join("Show Movie.mkv").exists());
+        assert!(!output.join("Season 1").join("Show Special.mkv").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn directly_links_video_files_in_the_show_root() {
         let root = std::env::temp_dir().join(format!(
             "metadata-corrector-show-root-test-{}",
@@ -1641,6 +1701,7 @@ mod tests {
         assert_eq!(extract_episode_number("Show - Episode 09"), Some(9));
         assert_eq!(extract_episode_number("Show - 10"), Some(10));
         assert_eq!(extract_episode_number("Show - 0439 - Title"), Some(439));
+        assert_eq!(extract_episode_number("Show - 1140v2"), Some(1140));
         assert_eq!(
             extract_episode_number("Show - S01E1000 - Title"),
             Some(1000)
@@ -1664,6 +1725,15 @@ mod tests {
             ),
             "[S13E0439] Show - 0439 - Title.mkv"
         );
+        assert_eq!(
+            corrected_file_name(
+                "Show - 1140v2",
+                21,
+                1140,
+                Some(std::ffi::OsStr::new("mkv")),
+            ),
+            "[S21E1140] Show - 1140.mkv"
+        );
     }
 
     #[test]
@@ -1676,7 +1746,7 @@ mod tests {
         let source = root.join("source");
         let output = root.join("output");
         let original_name = "[author] Show Name - S05E11v2.mkv";
-        let normalized_name = "[S05E11] [author] Show Name - 11v2.mkv";
+        let normalized_name = "[S05E11] [author] Show Name - 11.mkv";
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(original_name), b"episode").unwrap();
         std::fs::create_dir_all(&output).unwrap();
@@ -1746,12 +1816,12 @@ mod tests {
         );
         assert_eq!(
             corrected_file_name(
-                "[Judas] Rent-a-Girlfriend - S05E01v2",
+                "Show - S05E01v2",
                 5,
                 1,
                 Some(std::ffi::OsStr::new("mkv")),
             ),
-            "[S05E01] [Judas] Rent-a-Girlfriend - 01v2.mkv"
+            "[S05E01] Show - 01.mkv"
         );
     }
 

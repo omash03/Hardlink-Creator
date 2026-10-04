@@ -15,9 +15,12 @@ files are ignored.
   subfolder of a source root into a matching destination folder.
 - Recognize common season-folder and episode-filename conventions, including
   `Season 2`, `S02`, `S02 P2`, `S01E02`, `1x02`, and `Episode 02`, with
-  episode numbers up to four digits.
+  episode numbers up to four digits. Release revision suffixes such as `v2`
+  are removed when episode filenames are normalized.
 - Group split season folders, flatten wrapper folders that contain nested
   seasons, and skip duplicate season or episode numbers deterministically.
+  Unnumbered OVA/OAD, movie, and special folders retain their own destination
+  folders instead of being assigned to Season 1.
 - Create normalized episode names in the form
   `[SxxEyy] Title - yy.extension`, retaining the episode number in the title
   body and its original zero-padding. Direct video files with an `SxxEyy`
