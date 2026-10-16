@@ -48,9 +48,11 @@ macro_rules! log_line {
 ///
 /// Single-folder mode uses `source_directory` and `output_directory`. Batch
 /// mode uses the corresponding `*_root_directory` values and processes each
-/// immediate child folder under those roots. Optional fields are represented
-/// as `Option<PathBuf>` so a missing path can produce a useful mode-specific
-/// error instead of silently falling back to a different directory.
+/// immediate child folder under those roots. Multi-directory mode uses
+/// `directory_mappings`, where every source has an explicit hardlink destination.
+/// Optional legacy fields are represented as `Option<PathBuf>` so a missing
+/// path can produce a useful mode-specific error instead of silently falling
+/// back to a different directory.
 #[derive(Debug, Deserialize)]
 struct Config {
     /// One media folder to scan when `process_all_folders` is disabled.
@@ -68,12 +70,29 @@ struct Config {
     /// Root under which matching batch-mode output folders are created.
     #[serde(default)]
     output_root_directory: Option<PathBuf>,
+    /// Library-root and hardlink-root mappings for multi-directory mode.
+    #[serde(default, alias = "directory_pairs")]
+    directory_mappings: Vec<DirectoryPair>,
     /// Case-sensitive regular expressions matched against individual path components.
     #[serde(default)]
     blacklist: Vec<String>,
     /// Delay between completed scans, measured in seconds.
     #[serde(default = "default_scan_interval_seconds")]
     scan_interval_seconds: u64,
+}
+
+/// One source library root and its corresponding hardlink library root.
+#[derive(Debug, Deserialize)]
+struct DirectoryPair {
+    source_directory: PathBuf,
+    hardlink_directory: PathBuf,
+}
+
+/// A fully resolved traversal selected from the configuration.
+struct ScanTarget {
+    source_directory: PathBuf,
+    output_directory: PathBuf,
+    process_all_folders: bool,
 }
 
 /// Supplies the default scan interval used when older config files omit it.
@@ -107,17 +126,21 @@ impl Blacklist {
         Ok(Self { patterns })
     }
 
-    /// Return true when any path component matches any configured expression.
+    /// Return true when a path contains Featurettes or matches a configured expression.
     ///
     /// Matching components instead of the entire path lets a user blacklist a
     /// folder name and automatically exclude everything below that folder,
-    /// regardless of where it appears in the source tree.
+    /// regardless of where it appears in the source tree. Featurettes are
+    /// always excluded because their season labels are supplemental media,
+    /// not the show's primary episodes.
     fn matches(&self, path: &Path) -> bool {
         path.components().any(|component| {
             let component = component.as_os_str().to_string_lossy();
-            self.patterns
-                .iter()
-                .any(|pattern| pattern.is_match(&component))
+            component.eq_ignore_ascii_case("featurettes")
+                || self
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&component))
         })
     }
 }
@@ -151,44 +174,23 @@ fn run() -> Result<()> {
     let config_path = application_directory.join(CONFIG_FILE_NAME);
     let config = read_config(&config_path)?;
     let scan_interval = scan_interval(&config)?;
-    let configured_source = if config.process_all_folders {
-        config
-            .source_root_directory
-            .as_deref()
-            .context("source_root_directory is required when process_all_folders is true")?
-    } else {
-        config
-            .source_directory
-            .as_deref()
-            .context("source_directory is required when process_all_folders is false")?
-    };
-    let configured_output = if config.process_all_folders {
-        config
-            .output_root_directory
-            .as_deref()
-            .context("output_root_directory is required when process_all_folders is true")?
-    } else {
-        config
-            .output_directory
-            .as_deref()
-            .context("output_directory is required when process_all_folders is false")?
-    };
-    let source_directory = resolve_path(&application_directory, configured_source);
-    let output_directory = resolve_path(&application_directory, configured_output);
+    let scan_targets = configured_scan_targets(&config, &application_directory)?;
     let blacklist = Blacklist::from_patterns(&config.blacklist)?;
 
-    if !source_directory.is_dir() {
-        bail!(
-            "Source directory does not exist or is not a directory: {}",
-            source_directory.display()
-        );
+    for target in &scan_targets {
+        if !target.source_directory.is_dir() {
+            bail!(
+                "Source directory does not exist or is not a directory: {}",
+                target.source_directory.display()
+            );
+        }
+        fs::create_dir_all(&target.output_directory).with_context(|| {
+            format!(
+                "Could not create output directory {}",
+                target.output_directory.display()
+            )
+        })?;
     }
-    fs::create_dir_all(&output_directory).with_context(|| {
-        format!(
-            "Could not create output directory {}",
-            output_directory.display()
-        )
-    })?;
     let log_directory = application_directory.join(LOG_DIRECTORY_NAME);
     fs::create_dir_all(&log_directory)
         .with_context(|| format!("Could not create log directory {}", log_directory.display()))?;
@@ -208,32 +210,38 @@ fn run() -> Result<()> {
             .open(&log_path)
             .with_context(|| format!("Could not open log file {}", log_path.display()))?;
 
-        log_line!(
-            log,
-            "START mode={} source={} output={}",
-            if config.process_all_folders {
-                "all-folders"
+        let mut summary = Summary::default();
+        for target in &scan_targets {
+            log_line!(
+                log,
+                "START mode={} source={} output={}",
+                if target.process_all_folders {
+                    "all-folders"
+                } else if config.directory_mappings.is_empty() {
+                    "single-folder"
+                } else {
+                    "directory-pair"
+                },
+                target.source_directory.display(),
+                target.output_directory.display()
+            )?;
+            let target_summary = if target.process_all_folders {
+                create_hard_links_for_all_folders_with_blacklist(
+                    &target.source_directory,
+                    &target.output_directory,
+                    &mut log,
+                    &blacklist,
+                )?
             } else {
-                "single-folder"
-            },
-            source_directory.display(),
-            output_directory.display()
-        )?;
-        let summary = if config.process_all_folders {
-            create_hard_links_for_all_folders_with_blacklist(
-                &source_directory,
-                &output_directory,
-                &mut log,
-                &blacklist,
-            )?
-        } else {
-            create_hard_links_with_blacklist(
-                &source_directory,
-                &output_directory,
-                &mut log,
-                &blacklist,
-            )?
-        };
+                create_hard_links_with_blacklist(
+                    &target.source_directory,
+                    &target.output_directory,
+                    &mut log,
+                    &blacklist,
+                )?
+            };
+            summary.add(target_summary);
+        }
         log_line!(
             log,
             "COMPLETE linked={} skipped={} warnings={}",
@@ -281,6 +289,70 @@ fn scan_interval(config: &Config) -> Result<Duration> {
         bail!("scan_interval_seconds must be greater than zero");
     }
     Ok(Duration::from_secs(config.scan_interval_seconds))
+}
+
+/// Select and resolve the configured source and destination directory pairs.
+///
+/// The original single-folder and root-batch modes remain mutually exclusive
+/// with explicit pairs so a typo cannot cause one configuration section to be
+/// silently ignored.
+fn configured_scan_targets(
+    config: &Config,
+    application_directory: &Path,
+) -> Result<Vec<ScanTarget>> {
+    if !config.directory_mappings.is_empty() {
+        if config.source_directory.is_some()
+            || config.output_directory.is_some()
+            || config.process_all_folders
+            || config.source_root_directory.is_some()
+            || config.output_root_directory.is_some()
+        {
+            bail!(
+                "directory_mappings cannot be combined with source_directory, output_directory, process_all_folders, source_root_directory, or output_root_directory"
+            );
+        }
+
+        return Ok(config
+            .directory_mappings
+            .iter()
+            .map(|pair| ScanTarget {
+                source_directory: resolve_path(application_directory, &pair.source_directory),
+                output_directory: resolve_path(application_directory, &pair.hardlink_directory),
+                process_all_folders: true,
+            })
+            .collect());
+    }
+
+    let (configured_source, configured_output, process_all_folders) =
+        if config.process_all_folders {
+            (
+                config.source_root_directory.as_deref().context(
+                    "source_root_directory is required when process_all_folders is true",
+                )?,
+                config.output_root_directory.as_deref().context(
+                    "output_root_directory is required when process_all_folders is true",
+                )?,
+                true,
+            )
+        } else {
+            (
+                config
+                    .source_directory
+                    .as_deref()
+                    .context("source_directory is required when process_all_folders is false")?,
+                config
+                    .output_directory
+                    .as_deref()
+                    .context("output_directory is required when process_all_folders is false")?,
+                false,
+            )
+        };
+
+    Ok(vec![ScanTarget {
+        source_directory: resolve_path(application_directory, configured_source),
+        output_directory: resolve_path(application_directory, configured_output),
+        process_all_folders,
+    }])
 }
 
 /// Resolve a config path relative to the executable unless it is absolute.
@@ -1390,6 +1462,61 @@ mod tests {
     }
 
     #[test]
+    fn accepts_multiple_explicit_directory_mappings() {
+        let config: super::Config = serde_yaml::from_str(
+            "directory_mappings:\n  - source_directory: /source/one\n    hardlink_directory: /hardlinks/one\n  - source_directory: /source/two\n    hardlink_directory: /hardlinks/two\n",
+        )
+        .unwrap();
+
+        let targets =
+            super::configured_scan_targets(&config, std::path::Path::new("/application")).unwrap();
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0].source_directory,
+            std::path::PathBuf::from("/source/one")
+        );
+        assert_eq!(
+            targets[0].output_directory,
+            std::path::PathBuf::from("/hardlinks/one")
+        );
+        assert_eq!(
+            targets[1].source_directory,
+            std::path::PathBuf::from("/source/two")
+        );
+        assert_eq!(
+            targets[1].output_directory,
+            std::path::PathBuf::from("/hardlinks/two")
+        );
+        assert!(targets.iter().all(|target| target.process_all_folders));
+    }
+
+    #[test]
+    fn accepts_directory_pairs_as_a_compatibility_alias() {
+        let config: super::Config = serde_yaml::from_str(
+            "directory_pairs:\n  - source_directory: /source\n    hardlink_directory: /hardlinks\n",
+        )
+        .unwrap();
+
+        let targets =
+            super::configured_scan_targets(&config, std::path::Path::new("/application")).unwrap();
+
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn rejects_combining_directory_mappings_with_legacy_modes() {
+        let config: super::Config = serde_yaml::from_str(
+            "source_directory: /source\ndirectory_mappings:\n  - source_directory: /other-source\n    hardlink_directory: /hardlinks\n",
+        )
+        .unwrap();
+
+        assert!(
+            super::configured_scan_targets(&config, std::path::Path::new("/application")).is_err()
+        );
+    }
+
+    #[test]
     fn uses_a_five_minute_default_scan_interval() {
         let config: super::Config = serde_yaml::from_str("source_directory: /source\n").unwrap();
 
@@ -1461,6 +1588,57 @@ mod tests {
         assert!(log_contents.contains("sample.mkv"));
         assert!(log_contents.contains("SKIP folder="));
         assert!(log_contents.contains("Season 02"));
+        assert!(log_contents.contains("reason=blacklist"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_featurettes_before_they_can_claim_a_season_number() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-featurettes-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let featurettes_season = source.join("Featurettes").join("Season 1");
+        let actual_season = source.join("Season 1");
+        let output = root.join("output");
+        std::fs::create_dir_all(&featurettes_season).unwrap();
+        std::fs::create_dir_all(&actual_season).unwrap();
+        std::fs::write(
+            featurettes_season.join("Featurettes - S01E01.mkv"),
+            b"featurette",
+        )
+        .unwrap();
+        std::fs::write(actual_season.join("Show - S01E01.mkv"), b"episode one").unwrap();
+        std::fs::write(actual_season.join("Show - S01E02.mkv"), b"episode two").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 2);
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show - 01.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E02] Show - 02.mkv")
+                .exists()
+        );
+        assert!(
+            !output
+                .join("Season 1")
+                .join("[S01E01] Featurettes - 01.mkv")
+                .exists()
+        );
+        let log_contents = std::fs::read_to_string(root.join("changes.log")).unwrap();
+        assert!(log_contents.contains("Featurettes"));
         assert!(log_contents.contains("reason=blacklist"));
 
         std::fs::remove_dir_all(root).unwrap();

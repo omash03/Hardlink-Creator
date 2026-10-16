@@ -9,6 +9,15 @@ process_all_folders: false
 source_root_directory: "E:/media/folder/"
 output_root_directory: "E:/hardlinks/folder/"
 
+# To scan multiple independent library roots, replace the single-folder or
+# root-batch settings above with one or more explicit directory mappings.
+# Each immediate source folder is linked into its matching hardlink folder.
+# directory_mappings:
+#   - source_directory: "E:/media/shows"
+#     hardlink_directory: "E:/hardlinks/shows"
+#   - source_directory: "E:/media/movies"
+#     hardlink_directory: "E:/hardlinks/movies"
+
 # Run once immediately, then scan again after this many seconds. The process
 # stays open until it is stopped with Ctrl+C.
 scan_interval_seconds: 600
@@ -16,5 +25,6 @@ scan_interval_seconds: 600
 # Optional regular expressions matched against each source file/folder name.
 # A matching folder and its entire contents are skipped. Use inline regex flags
 # such as (?i) when a pattern should be case-insensitive.
+# Featurettes folders are skipped automatically; no blacklist entry is needed.
 blacklist: 
   - '^(?i)featurettes'

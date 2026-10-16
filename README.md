@@ -13,6 +13,8 @@ files are ignored.
 
 - Scan one configured source folder, or batch-process each immediate
   subfolder of a source root into a matching destination folder.
+- Scan multiple independently configured source folders, each with its own
+  explicit hardlink destination.
 - Recognize common season-folder and episode-filename conventions, including
   `Season 2`, `S02`, `S02 P2`, `S01E02`, `1x02`, and `Episode 02`, with
   episode numbers up to four digits. Release revision suffixes such as `v2`
@@ -27,7 +29,8 @@ files are ignored.
   marker are normalized as well; other direct video files keep their original
   name.
 - Filter video files by extension (case-insensitively) and skip configured
-  blacklist matches.
+  blacklist matches. `Featurettes` folders are always skipped so their
+  supplemental season labels cannot conflict with regular episodes.
 - Re-scan periodically, skipping existing destinations and links so repeat
   scans do not create duplicate links.
 - Write scan activity to a timestamped log under `logs/` beside the
@@ -52,11 +55,21 @@ process_all_folders: false
 source_root_directory: "E:/media"
 output_root_directory: "E:/hardlinks"
 
+# Alternatively, configure multiple independent library roots. Each immediate
+# source folder is linked into its matching hardlink folder. Do not combine
+# directory_mappings with the settings above.
+# directory_mappings:
+#   - source_directory: "E:/media/Shows"
+#     hardlink_directory: "E:/hardlinks/Shows"
+#   - source_directory: "E:/media/Movies"
+#     hardlink_directory: "E:/hardlinks/Movies"
+
 # The first scan starts immediately; later scans run at this interval.
 scan_interval_seconds: 600
 
 # Optional regular expressions checked against each path component.
 # A matching folder and its contents are skipped.
+# Featurettes folders are skipped automatically; no blacklist entry is needed.
 blacklist:
   - '^(?i)featurettes'
 ```
@@ -65,18 +78,18 @@ When `process_all_folders` is `false`, configure `source_directory` and
 `output_directory`. When it is `true`, configure `source_root_directory` and
 `output_root_directory`; each immediate source subfolder gets a corresponding
 output subfolder. Direct video files in the source root are processed there as
-well. Blacklist expressions are regular expressions, are matched against
-individual path components, and are compiled when the program starts.
+well. To scan multiple independent library roots, use `directory_mappings`;
+each entry requires `source_directory` and its corresponding
+`hardlink_directory`. Each immediate source subfolder gets a matching output
+subfolder, and direct video files in the mapped source root are processed
+there. `directory_mappings` cannot be combined with either single-folder or
+batch-mode path settings. Blacklist expressions are regular expressions, are matched
+against individual path components, and are compiled when the program starts.
 
 Run the executable after configuring it. It scans immediately, then repeats
 after `scan_interval_seconds` until stopped with Ctrl+C. The default interval
 is 300 seconds if omitted, and zero is not allowed. Changes to configuration
 take effect after restarting the application.
-
-## TODO: Features
-
-- Scan and create hard links for multiple libraries, with independently
-  configured source and destination paths for each library.
 
 ## TODO: Optimizations
 
