@@ -76,6 +76,10 @@ struct Config {
     /// Case-sensitive regular expressions matched against individual path components.
     #[serde(default)]
     blacklist: Vec<String>,
+    /// Regular expressions matched against folder names to preserve their tree
+    /// and filenames without normalization.
+    #[serde(default)]
+    preserve_folders: Vec<String>,
     /// Delay between completed scans, measured in seconds.
     #[serde(default = "default_scan_interval_seconds")]
     scan_interval_seconds: u64,
@@ -100,30 +104,42 @@ fn default_scan_interval_seconds() -> u64 {
     DEFAULT_SCAN_INTERVAL_SECONDS
 }
 
-/// Compiled blacklist expressions used during a scan.
+/// Compiled folder rules used during a scan.
 ///
 /// Expressions are compiled once at startup rather than once per file. This
 /// both makes invalid configuration fail early and keeps directory traversal
 /// focused on filesystem work.
 #[derive(Default)]
-struct Blacklist {
+struct FolderRules {
     /// Regexes tested against each component of a source path.
-    patterns: Vec<Regex>,
+    blacklist_patterns: Vec<Regex>,
+    /// Regexes tested against folder names to select verbatim traversal.
+    preserve_patterns: Vec<Regex>,
 }
 
-impl Blacklist {
-    /// Compile user-provided expressions into a scan-ready blacklist.
+impl FolderRules {
+    /// Compile user-provided expressions into scan-ready folder rules.
     ///
     /// Returning an error here prevents a malformed pattern from producing a
     /// partially processed library.
-    fn from_patterns(patterns: &[String]) -> Result<Self> {
-        let patterns = patterns
+    fn from_patterns(blacklist: &[String], preserve_folders: &[String]) -> Result<Self> {
+        let blacklist_patterns = blacklist
             .iter()
             .map(|pattern| {
                 Regex::new(pattern).with_context(|| format!("Invalid blacklist regex: {pattern}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { patterns })
+        let preserve_patterns = preserve_folders
+            .iter()
+            .map(|pattern| {
+                Regex::new(pattern)
+                    .with_context(|| format!("Invalid preserve_folders regex: {pattern}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            blacklist_patterns,
+            preserve_patterns,
+        })
     }
 
     /// Return true when a path contains Featurettes or matches a configured expression.
@@ -133,15 +149,26 @@ impl Blacklist {
     /// regardless of where it appears in the source tree. Featurettes are
     /// always excluded because their season labels are supplemental media,
     /// not the show's primary episodes.
-    fn matches(&self, path: &Path) -> bool {
+    fn is_blacklisted(&self, path: &Path) -> bool {
         path.components().any(|component| {
             let component = component.as_os_str().to_string_lossy();
             component.eq_ignore_ascii_case("featurettes")
                 || self
-                    .patterns
+                    .blacklist_patterns
                     .iter()
                     .any(|pattern| pattern.is_match(&component))
         })
+    }
+
+    /// Return true when a folder's name matches a verbatim-preservation rule.
+    fn preserves_folder(&self, path: &Path) -> bool {
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .is_some_and(|name| {
+                self.preserve_patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&name))
+            })
     }
 }
 
@@ -162,7 +189,7 @@ fn main() {
 /// they do not need to know whether they were called once or by a background
 /// worker.
 ///
-/// The configuration and compiled blacklist are intentionally loaded once.
+/// The configuration and compiled folder rules are intentionally loaded once.
 /// This means editing `config.yaml` while the process is running takes effect
 /// after restarting the application, which avoids changing source or output
 /// roots halfway through a scan.
@@ -175,7 +202,7 @@ fn run() -> Result<()> {
     let config = read_config(&config_path)?;
     let scan_interval = scan_interval(&config)?;
     let scan_targets = configured_scan_targets(&config, &application_directory)?;
-    let blacklist = Blacklist::from_patterns(&config.blacklist)?;
+    let folder_rules = FolderRules::from_patterns(&config.blacklist, &config.preserve_folders)?;
 
     for target in &scan_targets {
         if !target.source_directory.is_dir() {
@@ -230,14 +257,14 @@ fn run() -> Result<()> {
                     &target.source_directory,
                     &target.output_directory,
                     &mut log,
-                    &blacklist,
+                    &folder_rules,
                 )?
             } else {
                 create_hard_links_with_blacklist(
                     &target.source_directory,
                     &target.output_directory,
                     &mut log,
-                    &blacklist,
+                    &folder_rules,
                 )?
             };
             summary.add(target_summary);
@@ -397,7 +424,7 @@ impl Summary {
 }
 
 #[cfg(test)]
-/// Test convenience wrapper for the batch traversal without blacklist rules.
+/// Test convenience wrapper for the batch traversal without custom folder rules.
 fn create_hard_links_for_all_folders(
     source_root_directory: &Path,
     output_root_directory: &Path,
@@ -407,7 +434,7 @@ fn create_hard_links_for_all_folders(
         source_root_directory,
         output_root_directory,
         log,
-        &Blacklist::default(),
+        &FolderRules::default(),
     )
 }
 
@@ -421,8 +448,17 @@ fn create_hard_links_for_all_folders_with_blacklist(
     source_root_directory: &Path,
     output_root_directory: &Path,
     log: &mut File,
-    blacklist: &Blacklist,
+    folder_rules: &FolderRules,
 ) -> Result<Summary> {
+    if folder_rules.preserves_folder(source_root_directory) {
+        return create_preserved_folder_tree(
+            source_root_directory,
+            output_root_directory,
+            log,
+            folder_rules,
+        );
+    }
+
     let mut summary = Summary::default();
     // Scan files in the current directory before descending so a movie placed
     // beside season folders is handled by the same pass.
@@ -430,7 +466,8 @@ fn create_hard_links_for_all_folders_with_blacklist(
         source_root_directory,
         output_root_directory,
         log,
-        blacklist,
+        folder_rules,
+        true,
     )?);
     let mut folder_entries = read_directory_entries(source_root_directory)?;
     folder_entries.sort_by_key(|entry| entry.file_name());
@@ -441,7 +478,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
         }
 
         let source_folder = folder_entry.path();
-        if blacklist.matches(&source_folder) {
+        if folder_rules.is_blacklisted(&source_folder) {
             log_line!(
                 log,
                 "SKIP folder={} reason=blacklist",
@@ -452,6 +489,15 @@ fn create_hard_links_for_all_folders_with_blacklist(
         }
         let folder_name = folder_entry.file_name();
         let output_folder = output_root_directory.join(&folder_name);
+        if folder_rules.preserves_folder(&source_folder) {
+            summary.add(create_preserved_folder_tree(
+                &source_folder,
+                &output_folder,
+                log,
+                folder_rules,
+            )?);
+            continue;
+        }
         fs::create_dir_all(&output_folder).with_context(|| {
             format!(
                 "Could not create folder output directory {}",
@@ -469,7 +515,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
             &source_folder,
             &output_folder,
             log,
-            blacklist,
+            folder_rules,
         )?);
     }
 
@@ -477,7 +523,7 @@ fn create_hard_links_for_all_folders_with_blacklist(
 }
 
 #[cfg(test)]
-/// Test convenience wrapper for a single-folder traversal without blacklist rules.
+/// Test convenience wrapper for a single-folder traversal without custom folder rules.
 fn create_hard_links(
     source_directory: &Path,
     output_directory: &Path,
@@ -487,11 +533,11 @@ fn create_hard_links(
         source_directory,
         output_directory,
         log,
-        &Blacklist::default(),
+        &FolderRules::default(),
     )
 }
 
-/// Process one media tree while applying the configured blacklist.
+/// Process one media tree while applying the configured folder rules.
 ///
 /// A fresh `seasons_seen` set is created for every top-level scan. It prevents
 /// the same season number from being emitted twice within that scan, while the
@@ -500,7 +546,7 @@ fn create_hard_links_with_blacklist(
     source_directory: &Path,
     output_directory: &Path,
     log: &mut File,
-    blacklist: &Blacklist,
+    folder_rules: &FolderRules,
 ) -> Result<Summary> {
     let mut seasons_seen = HashSet::new();
     create_hard_links_recursive(
@@ -508,7 +554,7 @@ fn create_hard_links_with_blacklist(
         output_directory,
         &mut seasons_seen,
         log,
-        blacklist,
+        folder_rules,
     )
 }
 
@@ -524,8 +570,12 @@ fn create_hard_links_recursive(
     output_directory: &Path,
     seasons_seen: &mut HashSet<u32>,
     log: &mut File,
-    blacklist: &Blacklist,
+    folder_rules: &FolderRules,
 ) -> Result<Summary> {
+    if folder_rules.preserves_folder(source_directory) {
+        return create_preserved_folder_tree(source_directory, output_directory, log, folder_rules);
+    }
+
     let mut summary = Summary::default();
     let mut season_entries = read_directory_entries(source_directory)?;
     season_entries.sort_by_key(|entry| entry.file_name());
@@ -533,7 +583,8 @@ fn create_hard_links_recursive(
         source_directory,
         output_directory,
         log,
-        blacklist,
+        folder_rules,
+        true,
     )?);
 
     let mut processed_season_paths = HashSet::new();
@@ -545,7 +596,7 @@ fn create_hard_links_recursive(
         if processed_season_paths.contains(&season_path) {
             continue;
         }
-        if blacklist.matches(&season_path) {
+        if folder_rules.is_blacklisted(&season_path) {
             log_line!(
                 log,
                 "SKIP folder={} reason=blacklist",
@@ -556,6 +607,17 @@ fn create_hard_links_recursive(
         }
 
         let season_name = season_entry.file_name().to_string_lossy().into_owned();
+        if folder_rules.preserves_folder(&season_path) {
+            processed_season_paths.insert(season_path.clone());
+            let preserved_output_directory = output_directory.join(&season_name);
+            summary.add(create_preserved_folder_tree(
+                &season_path,
+                &preserved_output_directory,
+                log,
+                folder_rules,
+            )?);
+            continue;
+        }
         if contains_season_folder(&season_path)? {
             log_line!(
                 log,
@@ -568,7 +630,7 @@ fn create_hard_links_recursive(
                 output_directory,
                 seasons_seen,
                 log,
-                blacklist,
+                folder_rules,
             )?);
             continue;
         }
@@ -601,10 +663,14 @@ fn create_hard_links_recursive(
                 &nested_output_directory,
                 seasons_seen,
                 log,
-                blacklist,
+                folder_rules,
             )?);
             continue;
         };
+        let grouped_indices = grouped_indices
+            .into_iter()
+            .filter(|index| !folder_rules.preserves_folder(&season_entries[*index].path()))
+            .collect::<Vec<_>>();
         let grouped_paths = grouped_indices
             .iter()
             .map(|index| season_entries[*index].path())
@@ -637,7 +703,7 @@ fn create_hard_links_recursive(
             &destination_season,
             season_number,
             log,
-            blacklist,
+            folder_rules,
         )?);
     }
 
@@ -677,7 +743,7 @@ fn create_hard_links_for_season_folders(
     destination_season: &Path,
     season_number: u32,
     log: &mut File,
-    blacklist: &Blacklist,
+    folder_rules: &FolderRules,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     // This set spans every source folder in a split season. That is what makes
@@ -694,7 +760,7 @@ fn create_hard_links_for_season_folders(
             }
 
             let source_path = episode_entry.path();
-            if blacklist.matches(&source_path) {
+            if folder_rules.is_blacklisted(&source_path) {
                 log_line!(log, "SKIP file={} reason=blacklist", source_path.display())?;
                 summary.skipped += 1;
                 continue;
@@ -889,11 +955,68 @@ fn season_destination_name(season_number: u32) -> String {
 /// no reliable season context available at this level. Before creating a new
 /// link, the function checks both the intended destination name and all other
 /// files in the destination for an existing hard link to the same source.
+/// Preserve a matched folder's layout and original video filenames.
+fn create_preserved_folder_tree(
+    source_directory: &Path,
+    output_directory: &Path,
+    log: &mut File,
+    folder_rules: &FolderRules,
+) -> Result<Summary> {
+    log_line!(
+        log,
+        "PRESERVE folder={} output={} reason=preserve-regex",
+        source_directory.display(),
+        output_directory.display()
+    )?;
+    create_verbatim_tree(source_directory, output_directory, log, folder_rules)
+}
+
+/// Recursively link a subtree without changing its directory or file names.
+fn create_verbatim_tree(
+    source_directory: &Path,
+    output_directory: &Path,
+    log: &mut File,
+    folder_rules: &FolderRules,
+) -> Result<Summary> {
+    let mut summary =
+        create_direct_hard_links(source_directory, output_directory, log, folder_rules, false)?;
+    let mut folder_entries = read_directory_entries(source_directory)?;
+    folder_entries.sort_by_key(|entry| entry.file_name());
+
+    for folder_entry in folder_entries {
+        if !folder_entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let source_folder = folder_entry.path();
+        if folder_rules.is_blacklisted(&source_folder) {
+            log_line!(
+                log,
+                "SKIP folder={} reason=blacklist",
+                source_folder.display()
+            )?;
+            summary.skipped += 1;
+            continue;
+        }
+
+        let output_folder = output_directory.join(folder_entry.file_name());
+        summary.add(create_verbatim_tree(
+            &source_folder,
+            &output_folder,
+            log,
+            folder_rules,
+        )?);
+    }
+
+    Ok(summary)
+}
+
 fn create_direct_hard_links(
     source_directory: &Path,
     destination_directory: &Path,
     log: &mut File,
-    blacklist: &Blacklist,
+    folder_rules: &FolderRules,
+    normalize_filenames: bool,
 ) -> Result<Summary> {
     let mut summary = Summary::default();
     fs::create_dir_all(&destination_directory).with_context(|| {
@@ -911,7 +1034,7 @@ fn create_direct_hard_links(
         }
 
         let source_path = file_entry.path();
-        if blacklist.matches(&source_path) {
+        if folder_rules.is_blacklisted(&source_path) {
             log_line!(log, "SKIP file={} reason=blacklist", source_path.display())?;
             summary.skipped += 1;
             continue;
@@ -926,14 +1049,18 @@ fn create_direct_hard_links(
             continue;
         }
 
-        let destination_name = match source_path.file_stem().and_then(|stem| stem.to_str()) {
-            Some(source_stem) => extract_season_and_episode(source_stem)
-                .map(|(season, episode)| {
-                    corrected_file_name(source_stem, season, episode, source_path.extension())
-                })
-                .map(std::ffi::OsString::from)
-                .unwrap_or_else(|| file_entry.file_name()),
-            None => file_entry.file_name(),
+        let destination_name = if normalize_filenames {
+            match source_path.file_stem().and_then(|stem| stem.to_str()) {
+                Some(source_stem) => extract_season_and_episode(source_stem)
+                    .map(|(season, episode)| {
+                        corrected_file_name(source_stem, season, episode, source_path.extension())
+                    })
+                    .map(std::ffi::OsString::from)
+                    .unwrap_or_else(|| file_entry.file_name()),
+                None => file_entry.file_name(),
+            }
+        } else {
+            file_entry.file_name()
         };
         let original_destination_path = destination_directory.join(file_entry.file_name());
         let destination_path = destination_directory.join(destination_name);
@@ -956,19 +1083,21 @@ fn create_direct_hard_links(
             summary.skipped += 1;
             continue;
         }
-        if let Some(existing_link) = find_existing_hard_link(
-            &source_path,
-            destination_directory,
-            Some(&original_destination_path),
-        )? {
-            log_line!(
-                log,
-                "SKIP source={} destination={} reason=hard-link-exists",
-                source_path.display(),
-                existing_link.display()
-            )?;
-            summary.skipped += 1;
-            continue;
+        if normalize_filenames {
+            if let Some(existing_link) = find_existing_hard_link(
+                &source_path,
+                destination_directory,
+                Some(&original_destination_path),
+            )? {
+                log_line!(
+                    log,
+                    "SKIP source={} destination={} reason=hard-link-exists",
+                    source_path.display(),
+                    existing_link.display()
+                )?;
+                summary.skipped += 1;
+                continue;
+            }
         }
 
         match fs::hard_link(&source_path, &destination_path) {
@@ -1443,7 +1572,7 @@ mod tests {
     #[test]
     fn accepts_a_batch_only_configuration() {
         let config: super::Config = serde_yaml::from_str(
-            "process_all_folders: true\nsource_root_directory: /source\noutput_root_directory: /output\nblacklist: ['^sample']\n",
+            "process_all_folders: true\nsource_root_directory: /source\noutput_root_directory: /output\nblacklist: ['^sample']\npreserve_folders: ['(?i)^specials$']\n",
         )
         .unwrap();
 
@@ -1459,6 +1588,7 @@ mod tests {
             Some(std::path::Path::new("/output"))
         );
         assert_eq!(config.blacklist, vec!["^sample"]);
+        assert_eq!(config.preserve_folders, vec!["(?i)^specials$"]);
     }
 
     #[test]
@@ -1562,15 +1692,15 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(&output).unwrap();
-        let blacklist = super::Blacklist::from_patterns(&[
-            String::from(r"^sample\.mkv$"),
-            String::from(r"^Season 02$"),
-        ])
+        let folder_rules = super::FolderRules::from_patterns(
+            &[String::from(r"^sample\.mkv$"), String::from(r"^Season 02$")],
+            &[],
+        )
         .unwrap();
         let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
 
         let summary =
-            super::create_hard_links_with_blacklist(&source, &output, &mut log, &blacklist)
+            super::create_hard_links_with_blacklist(&source, &output, &mut log, &folder_rules)
                 .unwrap();
 
         assert_eq!(summary.linked, 1);
@@ -1589,6 +1719,84 @@ mod tests {
         assert!(log_contents.contains("SKIP folder="));
         assert!(log_contents.contains("Season 02"));
         assert!(log_contents.contains("reason=blacklist"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_matching_folder_trees_without_normalizing_names() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-preserve-folder-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let preserved_season = source.join("Custom Collection").join("Season 05");
+        let normal_season = source.join("Season 01");
+        let output = root.join("output");
+        let original_preserved_name = "Show - S05E11v2.mkv";
+        std::fs::create_dir_all(&preserved_season).unwrap();
+        std::fs::create_dir_all(&normal_season).unwrap();
+        std::fs::write(
+            preserved_season.join(original_preserved_name),
+            b"preserved episode",
+        )
+        .unwrap();
+        std::fs::write(normal_season.join("Show - S01E01.mkv"), b"normal episode").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let previous_normalized_link = output
+            .join("Custom Collection")
+            .join("Season 05")
+            .join("[S05E11] Show - 11.mkv");
+        let folder_rules =
+            super::FolderRules::from_patterns(&[], &[String::from(r"(?i)^custom collection$")])
+                .unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary =
+            super::create_hard_links_with_blacklist(&source, &output, &mut log, &folder_rules)
+                .unwrap();
+
+        let preserved_link = output
+            .join("Custom Collection")
+            .join("Season 05")
+            .join(original_preserved_name);
+        assert_eq!(summary.linked, 2);
+        assert!(preserved_link.exists());
+        assert!(
+            same_file::is_same_file(
+                preserved_season.join(original_preserved_name),
+                &preserved_link
+            )
+            .unwrap()
+        );
+        assert!(!output.join("Custom Collection").join("Season 5").exists());
+        assert!(
+            !output
+                .join("Custom Collection")
+                .join("Season 05")
+                .join("[S05E11] Show - 11.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show - 01.mkv")
+                .exists()
+        );
+
+        std::fs::remove_file(&preserved_link).unwrap();
+        std::fs::hard_link(
+            preserved_season.join(original_preserved_name),
+            &previous_normalized_link,
+        )
+        .unwrap();
+        let second_summary =
+            super::create_hard_links_with_blacklist(&source, &output, &mut log, &folder_rules)
+                .unwrap();
+        assert_eq!(second_summary.linked, 1);
+        assert!(preserved_link.exists());
+        assert!(previous_normalized_link.exists());
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -28,3 +28,10 @@ scan_interval_seconds: 600
 # Featurettes folders are skipped automatically; no blacklist entry is needed.
 blacklist: 
   - '^(?i)featurettes'
+
+# Optional regular expressions matched against each folder name. A matching
+# folder and its entire subtree keep their original folder and video filenames.
+# Video-extension filtering and blacklist rules still apply.
+# preserve_folders:
+#   - '(?i)^specials?$'
+#   - '^Raw Imports$'

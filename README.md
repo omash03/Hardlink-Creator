@@ -28,6 +28,9 @@ files are ignored.
   body and its original zero-padding. Direct video files with an `SxxEyy`
   marker are normalized as well; other direct video files keep their original
   name.
+- Preserve the folder structure and original video filenames for configured
+  folder-name regex matches, without changing the normal processing of other
+  folders.
 - Filter video files by extension (case-insensitively) and skip configured
   blacklist matches. `Featurettes` folders are always skipped so their
   supplemental season labels cannot conflict with regular episodes.
@@ -72,6 +75,13 @@ scan_interval_seconds: 600
 # Featurettes folders are skipped automatically; no blacklist entry is needed.
 blacklist:
   - '^(?i)featurettes'
+
+# Optional regular expressions matched against each folder's name. Matching
+# folders and all descendants keep their original folder and video filenames.
+# These patterns are case-sensitive unless you use an inline flag such as (?i).
+preserve_folders:
+  - '(?i)^specials?$'
+  - '^Raw Imports$'
 ```
 
 When `process_all_folders` is `false`, configure `source_directory` and
@@ -85,6 +95,11 @@ subfolder, and direct video files in the mapped source root are processed
 there. `directory_mappings` cannot be combined with either single-folder or
 batch-mode path settings. Blacklist expressions are regular expressions, are matched
 against individual path components, and are compiled when the program starts.
+`preserve_folders` expressions are matched against each folder's name, not the
+full path. When a folder matches, its complete subtree is hardlinked using the
+original folder names and video filenames; descendants are not normalized
+even if they have season-like names. Blacklisting still takes precedence, and
+only supported video files are linked.
 
 Run the executable after configuring it. It scans immediately, then repeats
 after `scan_interval_seconds` until stopped with Ctrl+C. The default interval
