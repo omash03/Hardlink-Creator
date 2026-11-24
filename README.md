@@ -22,7 +22,12 @@ files are ignored.
 - Group split season folders, flatten wrapper folders that contain nested
   seasons, and skip duplicate season or episode numbers deterministically.
   Unnumbered OVA/OAD, movie, and special folders retain their own destination
-  folders instead of being assigned to Season 1.
+  folders instead of being assigned to Season 1. Extras and opening/ending
+  folders retain their names and folder structure without episode normalization.
+  Opening/ending videos in Extras are placed in `Extras/Openings` and
+  `Extras/Endings` using their original filenames.
+- When a show has an Extras folder but no regular season folders, group video
+  files directly in the show folder into Season 1 while preserving Extras.
 - Create normalized episode names in the form
   `[SxxEyy] Title - yy.extension`, retaining the episode number in the title
   body and its original zero-padding. Direct video files with an `SxxEyy`

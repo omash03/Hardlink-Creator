@@ -579,13 +579,48 @@ fn create_hard_links_recursive(
     let mut summary = Summary::default();
     let mut season_entries = read_directory_entries(source_directory)?;
     season_entries.sort_by_key(|entry| entry.file_name());
-    summary.add(create_direct_hard_links(
-        source_directory,
-        output_directory,
-        log,
-        folder_rules,
-        true,
-    )?);
+    let mut has_extras_folder = false;
+    let mut has_direct_video_files = false;
+    for entry in &season_entries {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && is_extras_media_folder(&entry.file_name().to_string_lossy()) {
+            has_extras_folder = true;
+        } else if file_type.is_file() && is_video_file(&entry.path()) {
+            has_direct_video_files = true;
+        }
+    }
+    let group_direct_files_as_season_one =
+        has_extras_folder && has_direct_video_files && !contains_season_folder(source_directory)?;
+    if group_direct_files_as_season_one {
+        let destination_season = output_directory.join(season_destination_name(1));
+        fs::create_dir_all(&destination_season).with_context(|| {
+            format!(
+                "Could not create season directory {}",
+                destination_season.display()
+            )
+        })?;
+        log_line!(
+            log,
+            "ASSUME season=1 source={} output={} reason=extras-without-season-folders",
+            source_directory.display(),
+            destination_season.display()
+        )?;
+        summary.add(create_hard_links_for_season_folders(
+            &[source_directory.to_path_buf()],
+            &destination_season,
+            1,
+            log,
+            folder_rules,
+        )?);
+    } else {
+        summary.add(create_direct_hard_links(
+            source_directory,
+            output_directory,
+            log,
+            folder_rules,
+            true,
+        )?);
+    }
 
     let mut processed_season_paths = HashSet::new();
     for (season_index, season_entry) in season_entries.iter().enumerate() {
@@ -611,6 +646,42 @@ fn create_hard_links_recursive(
             processed_season_paths.insert(season_path.clone());
             let preserved_output_directory = output_directory.join(&season_name);
             summary.add(create_preserved_folder_tree(
+                &season_path,
+                &preserved_output_directory,
+                log,
+                folder_rules,
+            )?);
+            continue;
+        }
+        if is_extras_media_folder(&season_name) {
+            processed_season_paths.insert(season_path.clone());
+            let preserved_output_directory = output_directory.join(&season_name);
+            log_line!(
+                log,
+                "PRESERVE folder={} output={} reason=supplemental-media-folder",
+                season_path.display(),
+                preserved_output_directory.display()
+            )?;
+            summary.add(create_extras_tree(
+                &season_path,
+                &preserved_output_directory,
+                log,
+                folder_rules,
+            )?);
+            continue;
+        }
+        if is_opening_ending_folder(&season_name) {
+            processed_season_paths.insert(season_path.clone());
+            let destination_folder_name =
+                opening_ending_category(&season_name).unwrap_or(&season_name);
+            let preserved_output_directory = output_directory.join(destination_folder_name);
+            log_line!(
+                log,
+                "PRESERVE folder={} output={} reason=supplemental-media-folder",
+                season_path.display(),
+                preserved_output_directory.display()
+            )?;
+            summary.add(create_verbatim_tree(
                 &season_path,
                 &preserved_output_directory,
                 log,
@@ -719,6 +790,10 @@ fn contains_season_folder(directory: &Path) -> Result<bool> {
     let entries = read_directory_entries(directory)?;
     for (index, entry) in entries.iter().enumerate() {
         if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let folder_name = entry.file_name().to_string_lossy().into_owned();
+        if is_extras_media_folder(&folder_name) || is_opening_ending_folder(&folder_name) {
             continue;
         }
         if find_season_folder_group(&entries, index)?.is_some()
@@ -1011,6 +1086,157 @@ fn create_verbatim_tree(
     Ok(summary)
 }
 
+/// Preserve an Extras tree while separating opening and ending video files.
+fn create_extras_tree(
+    source_directory: &Path,
+    output_directory: &Path,
+    log: &mut File,
+    folder_rules: &FolderRules,
+) -> Result<Summary> {
+    fs::create_dir_all(output_directory).with_context(|| {
+        format!(
+            "Could not create extras directory {}",
+            output_directory.display()
+        )
+    })?;
+    let mut summary = Summary::default();
+    let mut entries = read_directory_entries(source_directory)?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let source_path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if folder_rules.is_blacklisted(&source_path) {
+                log_line!(
+                    log,
+                    "SKIP folder={} reason=blacklist",
+                    source_path.display()
+                )?;
+                summary.skipped += 1;
+                continue;
+            }
+
+            let folder_name = entry.file_name().to_string_lossy().into_owned();
+            let destination_folder_name =
+                opening_ending_category(&folder_name).unwrap_or(&folder_name);
+            let destination_directory = output_directory.join(destination_folder_name);
+            if is_opening_ending_folder(&folder_name) {
+                summary.add(create_verbatim_tree(
+                    &source_path,
+                    &destination_directory,
+                    log,
+                    folder_rules,
+                )?);
+            } else {
+                summary.add(create_extras_tree(
+                    &source_path,
+                    &destination_directory,
+                    log,
+                    folder_rules,
+                )?);
+            }
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        if folder_rules.is_blacklisted(&source_path) {
+            log_line!(log, "SKIP file={} reason=blacklist", source_path.display())?;
+            summary.skipped += 1;
+            continue;
+        }
+        if !is_video_file(&source_path) {
+            log_line!(
+                log,
+                "SKIP file={} reason=not-video-file",
+                source_path.display()
+            )?;
+            summary.skipped += 1;
+            continue;
+        }
+
+        let category_directory = source_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(opening_ending_category)
+            .map(|category| output_directory.join(category));
+        let destination_directory = category_directory.as_deref().unwrap_or(output_directory);
+        summary.add(create_original_name_hard_link(
+            &source_path,
+            destination_directory,
+            log,
+        )?);
+    }
+
+    Ok(summary)
+}
+
+/// Link one video file without changing its filename.
+fn create_original_name_hard_link(
+    source_path: &Path,
+    destination_directory: &Path,
+    log: &mut File,
+) -> Result<Summary> {
+    fs::create_dir_all(destination_directory).with_context(|| {
+        format!(
+            "Could not create directory {}",
+            destination_directory.display()
+        )
+    })?;
+    let destination_path = destination_directory.join(
+        source_path
+            .file_name()
+            .context("Video filename is not valid")?,
+    );
+    if destination_path.exists() {
+        log_line!(
+            log,
+            "SKIP source={} destination={} reason=destination-exists",
+            source_path.display(),
+            destination_path.display()
+        )?;
+        return Ok(Summary {
+            skipped: 1,
+            ..Summary::default()
+        });
+    }
+
+    match fs::hard_link(source_path, &destination_path) {
+        Ok(()) => {
+            log_line!(
+                log,
+                "DIRECT-LINK source={} destination={}",
+                source_path.display(),
+                destination_path.display()
+            )?;
+            Ok(Summary {
+                linked: 1,
+                ..Summary::default()
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            log_line!(
+                log,
+                "SKIP source={} destination={} reason=destination-exists",
+                source_path.display(),
+                destination_path.display()
+            )?;
+            Ok(Summary {
+                skipped: 1,
+                ..Summary::default()
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Could not create hard link {} -> {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        }),
+    }
+}
+
 fn create_direct_hard_links(
     source_directory: &Path,
     destination_directory: &Path,
@@ -1242,9 +1468,64 @@ fn is_special_media_folder(name: &str) -> bool {
         .any(|part| {
             matches!(
                 part.to_ascii_lowercase().as_str(),
-                "ova" | "ovas" | "oad" | "oads" | "movie" | "movies" | "special" | "specials"
+                "ova"
+                    | "ovas"
+                    | "oad"
+                    | "oads"
+                    | "movie"
+                    | "movies"
+                    | "special"
+                    | "specials"
+                    | "extra"
+                    | "extras"
+                    | "op"
+                    | "ops"
+                    | "ed"
+                    | "eds"
+                    | "opening"
+                    | "openings"
+                    | "ending"
+                    | "endings"
             )
         })
+}
+
+/// Return whether a folder is named for extras or bonus content.
+fn is_extras_media_folder(name: &str) -> bool {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| matches!(part.to_ascii_lowercase().as_str(), "extra" | "extras"))
+}
+
+/// Return whether a folder is named for opening or ending videos.
+fn is_opening_ending_folder(name: &str) -> bool {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "op" | "ops" | "ed" | "eds" | "opening" | "openings" | "ending" | "endings"
+            )
+        })
+}
+
+/// Select the destination folder for an opening/ending filename.
+fn opening_ending_category(name: &str) -> Option<&'static str> {
+    let parts = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| matches!(part.as_str(), "op" | "opening" | "openings"))
+    {
+        Some("Openings")
+    } else if parts
+        .iter()
+        .any(|part| matches!(part.as_str(), "ed" | "ending" | "endings"))
+    {
+        Some("Endings")
+    } else {
+        None
+    }
 }
 
 /// Parsed metadata used when comparing and grouping season folders.
@@ -1513,7 +1794,8 @@ fn corrected_file_name(
 mod tests {
     use super::{
         corrected_file_name, extract_episode_number, extract_season_and_episode,
-        extract_season_and_part_number, extract_season_folder_number, is_special_media_folder,
+        extract_season_and_part_number, extract_season_folder_number, is_extras_media_folder,
+        is_opening_ending_folder, is_special_media_folder,
     };
 
     #[test]
@@ -1542,7 +1824,21 @@ mod tests {
         assert!(is_special_media_folder("Show OADs"));
         assert!(is_special_media_folder("Show Movies"));
         assert!(is_special_media_folder("[Release] Show Specials"));
+        assert!(is_special_media_folder("Openings"));
+        assert!(is_special_media_folder("ED"));
         assert!(!is_special_media_folder("Showcase"));
+    }
+
+    #[test]
+    fn recognizes_extras_and_opening_ending_folders() {
+        assert!(is_extras_media_folder("Extras"));
+        assert!(is_extras_media_folder("Show - Extra Content"));
+        assert!(!is_extras_media_folder("Extraneous"));
+        assert!(is_opening_ending_folder("Openings"));
+        assert!(is_opening_ending_folder("Show Ending"));
+        assert!(is_opening_ending_folder("OP"));
+        assert!(is_opening_ending_folder("EDs"));
+        assert!(!is_opening_ending_folder("Showcase"));
     }
 
     #[test]
@@ -2041,6 +2337,127 @@ mod tests {
         );
         assert!(!output.join("Season 1").join("Show Movie.mkv").exists());
         assert!(!output.join("Season 1").join("Show Special.mkv").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn groups_root_episodes_and_preserves_extras_openings_and_endings() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-extras-openings-endings-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let extras = source.join("Extras");
+        let opening = extras.join("Show OP 01.mkv");
+        let ending = extras.join("Show ED 01.mkv");
+        let opening_folder = source.join("Opening");
+        let ending_folder = source.join("Ending");
+        let output = root.join("output");
+        std::fs::create_dir_all(&extras).unwrap();
+        std::fs::create_dir_all(&opening_folder).unwrap();
+        std::fs::create_dir_all(&ending_folder).unwrap();
+        std::fs::write(source.join("Show - Episode 01.mkv"), b"episode one").unwrap();
+        std::fs::write(source.join("Show - Episode 02.mkv"), b"episode two").unwrap();
+        std::fs::write(&opening, b"opening").unwrap();
+        std::fs::write(&ending, b"ending").unwrap();
+        std::fs::write(extras.join("Bonus Clip.mkv"), b"bonus").unwrap();
+        std::fs::write(opening_folder.join("Opening 02.mkv"), b"opening two").unwrap();
+        std::fs::write(ending_folder.join("Ending 02.mkv"), b"ending two").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 7);
+        assert_eq!(summary.warnings, 0);
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E01] Show - 01.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Season 1")
+                .join("[S01E02] Show - 02.mkv")
+                .exists()
+        );
+        for (original, linked) in [
+            (
+                extras.join("Bonus Clip.mkv"),
+                output.join("Extras").join("Bonus Clip.mkv"),
+            ),
+            (
+                opening,
+                output
+                    .join("Extras")
+                    .join("Openings")
+                    .join("Show OP 01.mkv"),
+            ),
+            (
+                ending,
+                output.join("Extras").join("Endings").join("Show ED 01.mkv"),
+            ),
+        ] {
+            assert!(linked.exists());
+            assert!(same_file::is_same_file(original, linked).unwrap());
+        }
+        assert!(
+            !output
+                .join("Season 1")
+                .join("[S01E01] Show OP 01.mkv")
+                .exists()
+        );
+        assert!(output.join("Openings").join("Opening 02.mkv").exists());
+        assert!(output.join("Endings").join("Ending 02.mkv").exists());
+        assert!(
+            !output
+                .join("Season 1")
+                .join("[S01E01] Show ED 01.mkv")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keeps_root_files_unassigned_when_a_regular_season_folder_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "metadata-corrector-extras-with-season-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let season = source.join("Season 1");
+        let extras = source.join("Extras");
+        let output = root.join("output");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::create_dir_all(&extras).unwrap();
+        std::fs::write(season.join("Show - S01E01.mkv"), b"season episode").unwrap();
+        std::fs::write(source.join("Show Episode 02.mkv"), b"root video").unwrap();
+        std::fs::write(extras.join("Show OP 01.mkv"), b"opening").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut log = std::fs::File::create(root.join("changes.log")).unwrap();
+
+        let summary = super::create_hard_links(&source, &output, &mut log).unwrap();
+
+        assert_eq!(summary.linked, 3);
+        assert!(output.join("Show Episode 02.mkv").exists());
+        assert!(
+            !output
+                .join("Season 1")
+                .join("[S01E02] Show - 02.mkv")
+                .exists()
+        );
+        assert!(
+            output
+                .join("Extras")
+                .join("Openings")
+                .join("Show OP 01.mkv")
+                .exists()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
